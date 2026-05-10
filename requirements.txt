@@ -1,0 +1,11 @@
+pywinauto>=0.6.8
+pyautogui>=0.9.54
+pyperclip>=1.8.2
+mss>=9.0.1
+Pillow>=10.0.0
+numpy>=1.26.0
+opencv-python>=4.8.0
+requests>=2.31.0
+
+# Optional: install only if you want --LLM --vision / YOLO image-region detection.
+# ultralytics>=8.2.0

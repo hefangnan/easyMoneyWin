@@ -18,6 +18,8 @@ import re
 import sqlite3
 import sys
 import time
+from ctypes import wintypes
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -26,9 +28,67 @@ from typing import Any, Callable, Iterable, Optional
 APP_NAME = "easyMoney Windows"
 APP_VERSION = "0.1.0"
 SCHEMA_VERSION = 24
+COMMENT_REFRESH_WAIT_SECONDS = 0.2
+COMMENT_REFRESH_CAPTURE_INTERVAL_SECONDS = 0.012
+COMMENT_REFRESH_IDLE_SECONDS = 0.003
+
+INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class INPUTUNION(ctypes.Union):
+    _fields_ = [
+        ("ki", KEYBDINPUT),
+        ("mi", MOUSEINPUT),
+        ("hi", HARDWAREINPUT),
+    ]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("union", INPUTUNION),
+    ]
 
 
 class EasyMoneyError(RuntimeError):
+    pass
+
+
+class UIAListItemUnavailable(EasyMoneyError):
     pass
 
 
@@ -92,6 +152,13 @@ class Rect:
         return f"({int(self.left)},{int(self.top)}) {int(self.width)}x{int(self.height)}"
 
 
+@dataclass(frozen=True)
+class CaptureFrame:
+    width: int
+    height: int
+    rgb: bytes
+
+
 @dataclass
 class CommentConfig:
     comment_from_action: Point
@@ -140,9 +207,20 @@ class MomentPostResolution:
     source: str
 
 
+@dataclass
+class UIAListItemResolution:
+    item_index: int
+    body_frame: Rect
+    action_point: Point
+    text: str
+    expected_user_id: str
+    detected_prefix: str
+    elapsed_ms: int
+
+
 HOME = Path.home()
 EASYMONEY_DIR = HOME / ".easyMoney"
-CONFIG_REFRESH_OFFSET = HOME / ".wechat_refresh_offset"
+CONFIG_REFRESH = HOME / ".wechat_refresh_offset"
 CONFIG_COMMENT = HOME / ".wechat_comment_config"
 CONFIG_AVATAR_OFFSET = HOME / ".wechat_avatar_offset"
 CONFIG_POST_IMAGE_TAP_OFFSET = HOME / ".wechat_post_image_tap_offset"
@@ -367,36 +445,154 @@ class InputBackend:
     def __init__(self) -> None:
         self.pyautogui = require_module("pyautogui")
         self.pyperclip = require_module("pyperclip")
-        self.pyautogui.PAUSE = 0.02
+        self.pyautogui.PAUSE = 0.0
+        self.native = os.name == "nt"
+        self.user32 = ctypes.windll.user32 if self.native else None
+        if self.user32 is not None:
+            try:
+                self.user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+                self.user32.SendInput.restype = wintypes.UINT
+            except Exception:
+                pass
+
+    @staticmethod
+    def _vk(key: str) -> int:
+        mapping = {
+            "tab": 0x09,
+            "enter": 0x0D,
+            "return": 0x0D,
+            "esc": 0x1B,
+            "escape": 0x1B,
+            "ctrl": 0x11,
+            "control": 0x11,
+            "shift": 0x10,
+            "alt": 0x12,
+            " ": 0x20,
+            "space": 0x20,
+        }
+        lowered = key.lower()
+        if lowered in mapping:
+            return mapping[lowered]
+        if len(key) == 1:
+            return ord(key.upper())
+        raise EasyMoneyError(f"不支持的按键: {key}")
 
     def position(self) -> Point:
+        if self.native and self.user32 is not None:
+            point = wintypes.POINT()
+            if self.user32.GetCursorPos(ctypes.byref(point)):
+                return Point(float(point.x), float(point.y))
         x, y = self.pyautogui.position()
         return Point(float(x), float(y))
 
     def click(self, point: Point, clicks: int = 1, interval: float = 0.04) -> None:
         x, y = point.rounded()
+        if self.native and self.user32 is not None:
+            self.user32.SetCursorPos(x, y)
+            if interval <= 0:
+                events: list[INPUT] = []
+                for _ in range(clicks):
+                    down = INPUT()
+                    down.type = INPUT_MOUSE
+                    down.union.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, 0)
+                    up = INPUT()
+                    up.type = INPUT_MOUSE
+                    up.union.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, 0)
+                    events.extend([down, up])
+                array_type = INPUT * len(events)
+                event_array = array_type(*events)
+                sent = self.user32.SendInput(len(events), event_array, ctypes.sizeof(INPUT))
+                if sent == len(events):
+                    return
+            for index in range(clicks):
+                self.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                self.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                if interval > 0 and index < clicks - 1:
+                    precise_delay(interval)
+            return
         self.pyautogui.click(x=x, y=y, clicks=clicks, interval=interval, button="left")
 
     def move_to(self, point: Point) -> None:
         x, y = point.rounded()
+        if self.native and self.user32 is not None:
+            self.user32.SetCursorPos(x, y)
+            return
         self.pyautogui.moveTo(x=x, y=y)
 
     def press(self, key: str) -> None:
+        if self.native and self.user32 is not None:
+            vk = self._vk(key)
+            self.user32.keybd_event(vk, 0, 0, 0)
+            self.user32.keybd_event(vk, 0, 0x0002, 0)
+            return
         self.pyautogui.press(key)
 
+    def press_sequence(self, keys: Iterable[str], gap: float = 0.0) -> None:
+        key_list = list(keys)
+        if not key_list:
+            return
+        if self.native and self.user32 is not None and gap <= 0:
+            events: list[INPUT] = []
+            for key in key_list:
+                vk = self._vk(key)
+                down = INPUT()
+                down.type = INPUT_KEYBOARD
+                down.union.ki = KEYBDINPUT(vk, 0, 0, 0, 0)
+                up = INPUT()
+                up.type = INPUT_KEYBOARD
+                up.union.ki = KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, 0)
+                events.extend([down, up])
+            array_type = INPUT * len(events)
+            event_array = array_type(*events)
+            sent = self.user32.SendInput(len(events), event_array, ctypes.sizeof(INPUT))
+            if sent == len(events):
+                return
+        for index, key in enumerate(key_list):
+            self.press(key)
+            if gap > 0 and index < len(key_list) - 1:
+                precise_delay(gap)
+
     def hotkey(self, *keys: str) -> None:
+        if self.native and self.user32 is not None:
+            vks = [self._vk(key) for key in keys]
+            for vk in vks:
+                self.user32.keybd_event(vk, 0, 0, 0)
+            for vk in reversed(vks):
+                self.user32.keybd_event(vk, 0, 0x0002, 0)
+            return
         self.pyautogui.hotkey(*keys)
 
-    def paste_text(self, text: str, restore_clipboard: bool = True) -> str:
+    @staticmethod
+    def can_type_directly(text: str) -> bool:
+        return bool(text) and text.isascii() and all(ch.isalnum() or ch == " " for ch in text)
+
+    def type_text_directly(self, text: str, interval: float = 0.0) -> str:
+        if not self.can_type_directly(text):
+            raise EasyMoneyError("当前文本不适合直接键盘输入")
+        if self.native and self.user32 is not None:
+            self.press_sequence(text, gap=interval)
+            return "直接键盘输入"
+        self.pyautogui.write(text, interval=interval)
+        return "直接键盘输入"
+
+    def paste_text(
+        self,
+        text: str,
+        restore_clipboard: bool = True,
+        before_paste_delay: float = 0.03,
+        after_paste_delay: float = 0.06,
+    ) -> str:
         old_text: Optional[str]
         try:
             old_text = self.pyperclip.paste()
         except Exception:
             old_text = None
         self.pyperclip.copy(text)
-        time.sleep(0.05)
+        if before_paste_delay > 0:
+            time.sleep(before_paste_delay)
         self.hotkey("ctrl", "v")
-        time.sleep(0.12)
+        if after_paste_delay > 0:
+            time.sleep(after_paste_delay)
         if restore_clipboard and old_text is not None:
             try:
                 self.pyperclip.copy(old_text)
@@ -406,21 +602,168 @@ class InputBackend:
 
 
 class CaptureBackend:
-    def __init__(self) -> None:
-        self.mss_mod = require_module("mss")
+    def __init__(self, backend: Optional[str] = None) -> None:
         self.Image = require_module("PIL.Image", "Pillow")
+        self.backend = (backend or os.environ.get("EASYMONEY_CAPTURE_BACKEND") or "auto").strip().lower()
+        self._dxcam_mod = None
+        self._dx_camera = None
+        self._dx_stream_region: Optional[tuple[int, int, int, int]] = None
+        self.mss_mod = None
+        self._sct = None
+        if self.backend in {"auto", "dxgi", "dxcam"}:
+            try:
+                self._dxcam_mod = importlib.import_module("dxcam")
+                output_idx = int(os.environ.get("EASYMONEY_DXGI_OUTPUT", "0"))
+                self._dx_camera = self._dxcam_mod.create(output_idx=output_idx, output_color="RGB")
+                if self._dx_camera is not None:
+                    self.backend = "dxgi"
+                    return
+            except ImportError as exc:
+                if self.backend in {"dxgi", "dxcam"}:
+                    raise EasyMoneyError("缺少 DXGI 依赖 `dxcam`，请运行: python -m pip install -r requirements.txt") from exc
+            except Exception as exc:
+                if self.backend in {"dxgi", "dxcam"}:
+                    raise EasyMoneyError(f"DXGI 捕获初始化失败: {exc}") from exc
+        self.backend = "mss"
+        self.mss_mod = require_module("mss")
+        if hasattr(self.mss_mod, "MSS"):
+            self._sct = self.mss_mod.MSS()
+        else:
+            self._sct = self.mss_mod.mss()
 
-    def screenshot(self, rect: Rect):
+    def grab(self, rect: Rect) -> CaptureFrame:
         if rect.width <= 0 or rect.height <= 0:
             raise EasyMoneyError(f"截图区域无效: {rect.describe()}")
-        with self.mss_mod.mss() as sct:
-            shot = sct.grab(rect.to_mss())
-            return self.Image.frombytes("RGB", shot.size, shot.rgb)
+        if self.backend == "dxgi" and self._dx_camera is not None:
+            region = (
+                int(round(rect.left)),
+                int(round(rect.top)),
+                int(round(rect.right)),
+                int(round(rect.bottom)),
+            )
+            if getattr(self._dx_camera, "is_capturing", False) and self._dx_stream_region != region:
+                self._stop_dx_stream()
+            frame = self._dx_camera.grab(region=region)
+            if frame is None:
+                raise EasyMoneyError(f"DXGI 截图失败: {rect.describe()}")
+            height, width = int(frame.shape[0]), int(frame.shape[1])
+            return CaptureFrame(width=width, height=height, rgb=frame.tobytes())
+        if self._sct is None:
+            raise EasyMoneyError("截图后端未初始化")
+        shot = self._sct.grab(rect.to_mss())
+        return CaptureFrame(width=int(shot.width), height=int(shot.height), rgb=shot.rgb)
+
+    def grab_stream(self, rect: Rect) -> CaptureFrame:
+        if self.backend != "dxgi" or self._dx_camera is None:
+            return self.grab(rect)
+        if rect.width <= 0 or rect.height <= 0:
+            raise EasyMoneyError(f"截图区域无效: {rect.describe()}")
+        region = (
+            int(round(rect.left)),
+            int(round(rect.top)),
+            int(round(rect.right)),
+            int(round(rect.bottom)),
+        )
+        if self._dx_stream_region != region or not getattr(self._dx_camera, "is_capturing", False):
+            self._stop_dx_stream()
+            fps = int(os.environ.get("EASYMONEY_DXGI_STREAM_FPS", "240"))
+            self._dx_camera.start(region=region, target_fps=fps, video_mode=True)
+            self._dx_stream_region = region
+        frame = self._dx_camera.get_latest_frame(copy=True)
+        if frame is None:
+            raise EasyMoneyError(f"DXGI 流采帧失败: {rect.describe()}")
+        height, width = int(frame.shape[0]), int(frame.shape[1])
+        return CaptureFrame(width=width, height=height, rgb=frame.tobytes())
+
+    def _stop_dx_stream(self) -> None:
+        stop = getattr(self._dx_camera, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception:
+                pass
+        self._dx_stream_region = None
+
+    def screenshot(self, rect: Rect):
+        shot = self.grab(rect)
+        return self.Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
 
     def save(self, image: Any, path: Path) -> Path:
         ensure_parent(path)
         image.save(path)
         return path
+
+    def close(self) -> None:
+        self._stop_dx_stream()
+        close = getattr(self._sct, "close", None)
+        if callable(close):
+            close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def quick_capture_fingerprint(capture: CaptureBackend, rect: Rect) -> Optional[int]:
+    try:
+        shot = capture.grab(rect)
+    except Exception:
+        return None
+    width, height = int(shot.width), int(shot.height)
+    if width <= 0 or height <= 0:
+        return None
+    data = shot.rgb
+    samples: list[int] = []
+    for row in range(8):
+        y = min(height - 1, max(0, int((row + 0.5) * height / 8)))
+        for col in range(8):
+            x = min(width - 1, max(0, int((col + 0.5) * width / 8)))
+            idx = (y * width + x) * 3
+            r, g, b = data[idx], data[idx + 1], data[idx + 2]
+            samples.append((int(r) * 30 + int(g) * 59 + int(b) * 11) // 100)
+    avg = sum(samples) / max(1, len(samples))
+    fingerprint = 0
+    for value in samples:
+        fingerprint = (fingerprint << 1) | (1 if value >= avg else 0)
+    return fingerprint
+
+
+def fingerprint_distance(lhs: int, rhs: int) -> int:
+    return (lhs ^ rhs).bit_count()
+
+
+def wait_for_region_refresh(
+    capture: CaptureBackend,
+    region: Rect,
+    baseline_fingerprint: Optional[int],
+    timeout_seconds: float = COMMENT_REFRESH_WAIT_SECONDS,
+) -> bool:
+    deadline = time.perf_counter() + max(0.001, timeout_seconds)
+    next_check = time.perf_counter()
+    while time.perf_counter() < deadline:
+        now = time.perf_counter()
+        if now >= next_check:
+            current = quick_capture_fingerprint(capture, region)
+            if current is not None:
+                if baseline_fingerprint is None:
+                    return True
+                if fingerprint_distance(baseline_fingerprint, current) >= 10:
+                    return True
+            next_check = now + COMMENT_REFRESH_CAPTURE_INTERVAL_SECONDS
+        else:
+            time.sleep(COMMENT_REFRESH_IDLE_SECONDS)
+    return False
+
+
+def refresh_observation_region(window_rect: Rect) -> Rect:
+    return Rect(
+        window_rect.left,
+        window_rect.top + min(60, max(0, window_rect.height * 0.08)),
+        window_rect.left + max(1, window_rect.width / 7),
+        window_rect.top + max(80, window_rect.height * 0.62),
+    ).clamp_to(window_rect)
 
 
 class WindowBackend:
@@ -522,15 +865,21 @@ class WindowBackend:
             for child in reversed(kids):
                 stack.append((child, depth + 1))
 
-    def dump_tree(self, control: Any, max_depth: int = 10, buttons_only: bool = False) -> None:
+    def dump_tree(self, control: Any, max_depth: int = 10, buttons_only: bool = False) -> tuple[int, bool, bool]:
         count = 0
+        found_sns_list = False
+        found_list_item = False
         for node, depth in self.iter_tree(control, max_depth=max_depth):
             control_type = self._control_type(node)
+            automation_id = self._automation_id(node)
+            if automation_id == "sns_list" and control_type.lower() == "list":
+                found_sns_list = True
+            if control_type.lower() == "listitem":
+                found_list_item = True
             if buttons_only and control_type.lower() != "button":
                 continue
             rect = self.rect(node)
             name = self._safe_text(node)
-            automation_id = self._automation_id(node)
             indent = "  " * depth
             parts = [f"{indent}[{control_type or '?'}]"]
             if name:
@@ -543,17 +892,28 @@ class WindowBackend:
             count += 1
         if buttons_only:
             print(f"\n按钮数量: {count}")
+        return count, found_sns_list, found_list_item
 
     def find_buttons(self, control: Any, max_depth: int = 12) -> list[Any]:
         return [node for node, _ in self.iter_tree(control, max_depth=max_depth) if self._control_type(node).lower() == "button"]
 
-    def click_control(self, control: Any, input_backend: Optional[InputBackend] = None) -> bool:
+    def click_control(
+        self,
+        control: Any,
+        input_backend: Optional[InputBackend] = None,
+        prefer_coordinate: bool = False,
+    ) -> bool:
+        rect = self.rect(control)
+        if prefer_coordinate and rect is not None:
+            if input_backend is None:
+                input_backend = InputBackend()
+            input_backend.click(rect.center)
+            return True
         try:
             control.invoke()
             return True
         except Exception:
             pass
-        rect = self.rect(control)
         if rect is None:
             return False
         if input_backend is None:
@@ -566,6 +926,17 @@ def countdown(seconds: int = 3) -> None:
     for i in range(seconds, 0, -1):
         print(f"  {i}...")
         time.sleep(1)
+
+
+def precise_delay(seconds: float) -> None:
+    if seconds <= 0:
+        return
+    if seconds >= 0.01:
+        time.sleep(seconds)
+        return
+    deadline = time.perf_counter() + seconds
+    while time.perf_counter() < deadline:
+        pass
 
 
 def save_avatar_template_at(point: Point, window_rect: Rect, path: Path, side: int = 80) -> Path:
@@ -599,18 +970,91 @@ def template_match(screen_image: Any, template_path: Path, threshold: float = 0.
     return Point(float(x), float(y)), float(max_val)
 
 
+@dataclass
+class AvatarMatchAttempt:
+    center: Optional[Point]
+    score: float
+    capture_ms: int
+    convert_ms: int
+    match_ms: int
+    total_ms: int
+    region: Rect
+
+
+class AvatarMatcher:
+    def __init__(self, template_path: Path, threshold: float) -> None:
+        self.template_path = template_path
+        self.threshold = threshold
+        self.cv2 = require_module("cv2", "opencv-python")
+        self.np = require_module("numpy")
+        image_mod = require_module("PIL.Image", "Pillow")
+        try:
+            tpl_pil = image_mod.open(template_path).convert("RGB")
+        except Exception as exc:
+            raise EasyMoneyError(f"头像模板读取失败: {template_path} ({exc})") from exc
+        tpl_rgb = self.np.asarray(tpl_pil)
+        self.tpl_gray = self.cv2.cvtColor(tpl_rgb, self.cv2.COLOR_RGB2GRAY)
+        self.capture = CaptureBackend()
+        self.stream = os.environ.get("EASYMONEY_AVATAR_STREAM", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+    def search_region(self, window_rect: Rect, match_mode: str) -> Rect:
+        if match_mode == "wide":
+            return Rect(window_rect.left, window_rect.top, window_rect.left + window_rect.width * 0.30, window_rect.bottom)
+        avatar_offset = load_point(CONFIG_AVATAR_OFFSET)
+        if avatar_offset is not None:
+            expected_center = Point(window_rect.left + avatar_offset.x, window_rect.top + avatar_offset.y)
+            strip_width = max(72.0, min(96.0, window_rect.width * 0.14))
+            search_top = max(window_rect.top + 48.0, expected_center.y - 220.0)
+            search_bottom = min(window_rect.bottom - 40.0, expected_center.y + 260.0)
+            if search_bottom <= search_top + 80:
+                search_top = window_rect.top
+                search_bottom = window_rect.top + window_rect.height * 0.78
+            return Rect(
+                expected_center.x - strip_width / 2,
+                search_top,
+                expected_center.x + strip_width / 2,
+                search_bottom,
+            ).clamp_to(window_rect)
+        return Rect(window_rect.left, window_rect.top, window_rect.left + window_rect.width * 0.28, window_rect.top + window_rect.height * 0.78)
+
+    def match_in_window(self, window_rect: Rect, match_mode: str) -> AvatarMatchAttempt:
+        total_start = time.perf_counter()
+        region = self.search_region(window_rect, match_mode)
+
+        capture_start = time.perf_counter()
+        shot = self.capture.grab_stream(region) if self.stream else self.capture.grab(region)
+        capture_ms = int((time.perf_counter() - capture_start) * 1000)
+
+        convert_start = time.perf_counter()
+        screen_rgb = self.np.frombuffer(shot.rgb, dtype=self.np.uint8).reshape((shot.height, shot.width, 3))
+        screen_gray = self.cv2.cvtColor(screen_rgb, self.cv2.COLOR_RGB2GRAY)
+        convert_ms = int((time.perf_counter() - convert_start) * 1000)
+
+        match_start = time.perf_counter()
+        if self.tpl_gray.shape[0] > screen_gray.shape[0] or self.tpl_gray.shape[1] > screen_gray.shape[1]:
+            match_ms = int((time.perf_counter() - match_start) * 1000)
+            total_ms = int((time.perf_counter() - total_start) * 1000)
+            return AvatarMatchAttempt(None, 0.0, capture_ms, convert_ms, match_ms, total_ms, region)
+
+        result = self.cv2.matchTemplate(screen_gray, self.tpl_gray, self.cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = self.cv2.minMaxLoc(result)
+        match_ms = int((time.perf_counter() - match_start) * 1000)
+        total_ms = int((time.perf_counter() - total_start) * 1000)
+
+        if max_val < self.threshold:
+            return AvatarMatchAttempt(None, float(max_val), capture_ms, convert_ms, match_ms, total_ms, region)
+
+        local_x = max_loc[0] + self.tpl_gray.shape[1] / 2
+        local_y = max_loc[1] + self.tpl_gray.shape[0] / 2
+        center = Point(region.left + local_x, region.top + local_y)
+        return AvatarMatchAttempt(center, float(max_val), capture_ms, convert_ms, match_ms, total_ms, region)
+
+
 def find_avatar_in_window(window_rect: Rect, template_path: Path, threshold: float, match_mode: str) -> tuple[Point, float]:
-    capture = CaptureBackend()
-    if match_mode == "wide":
-        region = Rect(window_rect.left, window_rect.top, window_rect.left + window_rect.width * 0.30, window_rect.bottom)
-    else:
-        region = Rect(window_rect.left, window_rect.top, window_rect.left + window_rect.width * 0.28, window_rect.top + window_rect.height * 0.78)
-    image = capture.screenshot(region)
-    match = template_match(image, template_path, threshold=threshold)
-    if match is None:
-        raise EasyMoneyError(f"未匹配到目标头像，模板={template_path} 阈值={threshold:.2f}")
-    local_center, score = match
-    return Point(region.left + local_center.x, region.top + local_center.y), score
+    attempt = AvatarMatcher(template_path, threshold).match_in_window(window_rect, match_mode)
+    if attempt.center is None:
+        raise EasyMoneyError(f"未匹配到目标头像，模板={template_path} 阈值={threshold:.2f} best={attempt.score:.3f}")
+    return attempt.center, attempt.score
 
 
 BLOCKED_TEXT_SNIPPETS = {
@@ -640,7 +1084,388 @@ def clean_post_text(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def resolve_moment_post(window_backend: WindowBackend, win: Any, window_rect: Rect, avatar_center: Point, require_text: bool) -> MomentPostResolution:
+def uia_list_item_prefix(text: str) -> str:
+    for raw in text.replace("\r", "\n").split("\n"):
+        line = raw.strip()
+        if line:
+            return line
+    return ""
+
+
+def uia_list_item_matches_user_id(text: str, expected_user_id: str) -> bool:
+    expected = expected_user_id.strip()
+    if not expected:
+        return False
+    return text.lstrip().startswith(expected)
+
+
+def short_log_text(text: str, limit: int = 48) -> str:
+    clean = text.replace("\r", " ").replace("\n", " ").strip()
+    if len(clean) <= limit:
+        return clean
+    return clean[:limit] + "..."
+
+
+def is_sns_list_control(window_backend: WindowBackend, node: Any) -> bool:
+    return window_backend._automation_id(node) == "sns_list" and window_backend._control_type(node).lower() == "list"
+
+
+def find_sns_list_control(window_backend: WindowBackend, root: Any, max_depth: int = 8) -> Optional[Any]:
+    for node, _ in window_backend.iter_tree(root, max_depth=max_depth):
+        if is_sns_list_control(window_backend, node):
+            return node
+
+    try:
+        child_window = getattr(root, "child_window", None)
+        if callable(child_window):
+            spec = child_window(auto_id="sns_list", control_type="List")
+            wrapper = spec.wrapper_object()
+            if is_sns_list_control(window_backend, wrapper):
+                return wrapper
+    except Exception:
+        pass
+
+    try:
+        descendants = root.descendants(auto_id="sns_list", control_type="List")
+    except Exception:
+        descendants = []
+    for node in descendants:
+        if is_sns_list_control(window_backend, node):
+            return node
+    return None
+
+
+def find_list_items_under_control(window_backend: WindowBackend, root: Any, max_depth: int = 3, limit: Optional[int] = None) -> list[Any]:
+    items: list[Any] = []
+    seen: set[int] = set()
+
+    def add_if_list_item(node: Any) -> bool:
+        marker = id(node)
+        if marker in seen:
+            return False
+        if window_backend._control_type(node).lower() != "listitem":
+            return False
+        seen.add(marker)
+        items.append(node)
+        return limit is not None and len(items) >= limit
+
+    for node in window_backend.children(root):
+        if add_if_list_item(node):
+            return items
+
+    if items and (limit is None or len(items) >= limit):
+        return items
+
+    for node, depth in window_backend.iter_tree(root, max_depth=max_depth):
+        if depth == 0:
+            continue
+        if add_if_list_item(node):
+            return items
+
+    if items and (limit is None or len(items) >= limit):
+        return items
+
+    try:
+        descendants = root.descendants(control_type="ListItem")
+    except Exception:
+        descendants = []
+    for node in descendants:
+        if add_if_list_item(node):
+            return items
+    if items:
+        return items
+
+    try:
+        descendants = root.descendants()
+    except Exception:
+        descendants = []
+    for node in descendants:
+        if add_if_list_item(node):
+            return items
+    return items
+
+
+def find_uia_list_items(window_backend: WindowBackend, root: Any, max_depth: int = 12, limit: Optional[int] = None) -> list[Any]:
+    sns_list = find_sns_list_control(window_backend, root, max_depth=max_depth)
+    if sns_list is None:
+        return []
+    return find_list_items_under_control(window_backend, sns_list, limit=limit)
+
+
+def resolve_second_uia_list_item_post(
+    window_backend: WindowBackend,
+    win: Any,
+    expected_user_id: str,
+    item_index: int = 1,
+    settle_ms: int = 220,
+    poll_ms: int = 40,
+    include_text: bool = True,
+) -> UIAListItemResolution:
+    started = time.perf_counter()
+    deadline = started + max(0, settle_ms) / 1000
+    items: list[Any] = []
+    while True:
+        sns_list = find_sns_list_control(window_backend, win)
+        if sns_list is None:
+            items = []
+        else:
+            items = find_list_items_under_control(window_backend, sns_list, limit=item_index + 1)
+        if len(items) > item_index:
+            break
+        if time.perf_counter() >= deadline:
+            if sns_list is None:
+                raise UIAListItemUnavailable("UIA 未暴露 sns_list，无法读取朋友圈列表")
+            raise UIAListItemUnavailable(
+                f"UIA 中 ListItem 数量不足: 当前 {len(items)} 个，无法读取第 {item_index + 1} 个"
+            )
+        time.sleep(max(0.01, poll_ms / 1000))
+    if len(items) <= item_index:
+        raise UIAListItemUnavailable(f"UIA 中 ListItem 数量不足: 当前 {len(items)} 个，无法读取第 {item_index + 1} 个")
+
+    item = items[item_index]
+    raw_text = window_backend._safe_text(item).strip()
+    if not raw_text:
+        raise EasyMoneyError(f"第 {item_index + 1} 个 ListItem 的 name 为空")
+    prefix = uia_list_item_prefix(raw_text)
+    if not uia_list_item_matches_user_id(raw_text, expected_user_id):
+        preview = raw_text.replace("\r", "\n").replace("\n", " / ")[:120]
+        raise EasyMoneyError(
+            f"第 {item_index + 1} 个 ListItem 不匹配 --user={expected_user_id}；"
+            f"检测到开头={prefix or '(空)'}；内容预览={preview}"
+        )
+
+    rect = window_backend.rect(item)
+    if rect is None:
+        raise EasyMoneyError(f"第 {item_index + 1} 个 ListItem 无有效坐标")
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    action_point = Point(rect.right - 40, rect.bottom - 10)
+    return UIAListItemResolution(
+        item_index=item_index,
+        body_frame=rect,
+        action_point=action_point,
+        text=clean_post_text(raw_text) if include_text else "",
+        expected_user_id=expected_user_id.strip(),
+        detected_prefix=prefix,
+        elapsed_ms=elapsed_ms,
+    )
+
+
+def fallback_post_from_avatar(window_rect: Rect, avatar_center: Point, action_point: Optional[Point] = None, source: str = "visual:avatar-geometry") -> MomentPostResolution:
+    fallback = Rect(
+        window_rect.left + window_rect.width * 0.20,
+        max(window_rect.top, avatar_center.y - 48),
+        window_rect.right - 16,
+        min(window_rect.bottom, avatar_center.y + 68),
+    )
+    return MomentPostResolution(
+        avatar_center=avatar_center,
+        body_frame=fallback,
+        action_point=action_point or Point(window_rect.right - 40, fallback.bottom - 10),
+        text="",
+        source=source,
+    )
+
+
+def resolve_visual_post_action(window_rect: Rect, avatar_center: Point, capture: Optional[CaptureBackend]) -> Optional[MomentPostResolution]:
+    if capture is None or not ACTION_TEMPLATE.exists():
+        return None
+    search = Rect(
+        window_rect.left + window_rect.width * 0.52,
+        max(window_rect.top + 40, avatar_center.y - 70),
+        window_rect.right,
+        min(window_rect.bottom, avatar_center.y + 260),
+    ).clamp_to(window_rect)
+    try:
+        image = capture.screenshot(search)
+        match = template_match(image, ACTION_TEMPLATE, threshold=0.66)
+    except Exception:
+        return None
+    if match is None:
+        return None
+    local_center, score = match
+    action_point = Point(search.left + local_center.x, search.top + local_center.y)
+    return fallback_post_from_avatar(
+        window_rect,
+        avatar_center,
+        action_point=action_point,
+        source=f"visual:action-template score={score:.3f}",
+    )
+
+
+def resolve_uia_list_item_post_by_avatar_y(
+    window_backend: WindowBackend,
+    win: Any,
+    window_rect: Rect,
+    avatar_center: Point,
+    require_text: bool,
+    settle_ms: int = 120,
+    debug_uia: bool = False,
+) -> Optional[MomentPostResolution]:
+    started = time.perf_counter()
+    deadline = started + max(0, settle_ms) / 1000
+    last_list_ms = 0
+    last_scan_ms = 0
+    debug_uia = debug_uia or os.environ.get("EASYMONEY_UIA_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+    while True:
+        list_start = time.perf_counter()
+        items = find_uia_list_items(window_backend, win, max_depth=20)
+        last_list_ms = int((time.perf_counter() - list_start) * 1000)
+        scan_start = time.perf_counter()
+        candidates: list[tuple[float, int, Rect, str]] = []
+        for index, item in enumerate(items):
+            rect = window_backend.rect(item)
+            if rect is None:
+                continue
+            if rect.width < 80 or rect.height < 12:
+                continue
+            if rect.width > window_rect.width * 0.98 and rect.height > window_rect.height * 0.65:
+                continue
+            if rect.right < window_rect.left + 24 or rect.left > window_rect.right - 24:
+                continue
+            if not rect.intersects_y(avatar_center.y, tolerance=16):
+                continue
+            text = ""
+            if require_text:
+                text = clean_post_text(window_backend._safe_text(item))
+                if not text:
+                    continue
+            distance = abs(rect.center.y - avatar_center.y)
+            area_penalty = (rect.width * rect.height) / max(1.0, window_rect.width * window_rect.height) if require_text else 0.0
+            candidates.append((distance + area_penalty * 25, index, rect, text))
+        last_scan_ms = int((time.perf_counter() - scan_start) * 1000)
+        if debug_uia:
+            preview = ", ".join(
+                f"#{idx}:{window_backend.rect(item).describe() if window_backend.rect(item) else 'no-rect'}"
+                for idx, item in enumerate(items[:6])
+            )
+            print(f"  [uia-debug] ListItem扫描 items={len(items)} candidates={len(candidates)} list={last_list_ms}ms scan={last_scan_ms}ms {preview}")
+        if candidates:
+            _, index, body_frame, text = min(candidates, key=lambda item: (item[0], item[1]))
+            total_ms = int((time.perf_counter() - started) * 1000)
+            mode = "full" if text else "frame-only"
+            return MomentPostResolution(
+                avatar_center=avatar_center,
+                body_frame=body_frame,
+                action_point=Point(body_frame.right - 40, body_frame.bottom - 10),
+                text=text,
+                source=f"UIA:ListItem {mode} candidate#{index} list={last_list_ms}ms scan={last_scan_ms}ms total={total_ms}ms",
+            )
+        if time.perf_counter() >= deadline:
+            return None
+        time.sleep(0.02)
+
+
+def resolve_moment_post(
+    window_backend: WindowBackend,
+    win: Any,
+    window_rect: Rect,
+    avatar_center: Point,
+    require_text: bool,
+    capture: Optional[CaptureBackend] = None,
+    debug_uia: bool = False,
+) -> MomentPostResolution:
+    total_start = time.perf_counter()
+    window_area = max(1.0, window_rect.width * window_rect.height)
+    y_tolerance = 16
+    list_start = time.perf_counter()
+    sns_list_root = find_sns_list_control(window_backend, win, max_depth=20)
+    list_root = sns_list_root or win
+    list_root_label = "sns_list" if sns_list_root is not None else "window"
+    list_ms = int((time.perf_counter() - list_start) * 1000)
+
+    candidates: list[tuple[float, int, Rect, Rect, str]] = []
+    visited: set[int] = set()
+    traversal_index = 0
+
+    def visit(node: Any, depth: int) -> None:
+        nonlocal traversal_index
+        if depth > 2:
+            return
+        marker = id(node)
+        if marker in visited:
+            return
+        visited.add(marker)
+        children = window_backend.children(node)
+
+        if len(children) > 1:
+            body_node = children[1]
+            body_frame = window_backend.rect(body_node)
+            if body_frame is not None:
+                if body_frame.width > window_rect.width * 0.96 and body_frame.height > window_rect.height * 0.45:
+                    pass
+                else:
+                    raw_text = ""
+                    text = ""
+                    if require_text:
+                        raw_text = window_backend._safe_text(body_node).strip()
+                        text = clean_post_text(raw_text)
+                    if (not require_text or text) and body_frame.intersects_y(avatar_center.y, tolerance=y_tolerance):
+                        if (
+                            body_frame.right >= window_rect.left + 24
+                            and body_frame.left <= window_rect.right - 24
+                            and body_frame.width > 80
+                            and body_frame.height > 12
+                        ):
+                            container_frame = (window_backend.rect(node) or body_frame) if require_text else body_frame
+                            avatar_distance = abs(body_frame.center.y - avatar_center.y)
+                            area_penalty = (container_frame.width * container_frame.height) / window_area if require_text else 0.0
+                            score = avatar_distance + area_penalty * 25
+                            candidates.append((score, traversal_index, container_frame, body_frame, text))
+                            traversal_index += 1
+
+        for child in children:
+            visit(child, depth + 1)
+
+    traverse_start = time.perf_counter()
+    visit(list_root, 0)
+    traverse_ms = int((time.perf_counter() - traverse_start) * 1000)
+
+    if candidates:
+        _, index, container_frame, body_frame, text = min(candidates, key=lambda item: (item[0], item[1]))
+        action_point = Point(body_frame.right - 40, body_frame.bottom - 10)
+        total_ms = int((time.perf_counter() - total_start) * 1000)
+        mode = "full" if text else "frame-only"
+        return MomentPostResolution(
+            avatar_center=avatar_center,
+            body_frame=body_frame,
+            action_point=action_point,
+            text=text,
+            source=f"UIA:AXChildren[1] {mode} root={list_root_label} candidate#{index} list={list_ms}ms traverse={traverse_ms}ms total={total_ms}ms",
+        )
+
+    if require_text:
+        list_item_post = resolve_uia_list_item_post_by_avatar_y(
+            window_backend,
+            win,
+            window_rect,
+            avatar_center,
+            require_text=True,
+            settle_ms=260,
+            debug_uia=debug_uia,
+        )
+        if list_item_post is not None:
+            return list_item_post
+        raise EasyMoneyError(
+            "已匹配头像，但 UIA 未能按 Swift 逻辑读取该动态正文；"
+            f"找列表{list_ms}ms 遍历{traverse_ms}ms"
+        )
+
+    list_item_post = resolve_uia_list_item_post_by_avatar_y(
+        window_backend,
+        win,
+        window_rect,
+        avatar_center,
+        require_text=False,
+        settle_ms=int(os.environ.get("EASYMONEY_UIA_POST_SETTLE_MS", "120")),
+        debug_uia=debug_uia,
+    )
+    if list_item_post is not None:
+        return list_item_post
+
+    visual = resolve_visual_post_action(window_rect, avatar_center, capture)
+    if visual is not None:
+        return visual
+
     candidates: list[tuple[float, Rect, str, str]] = []
     for node, depth in window_backend.iter_tree(win, max_depth=8):
         rect = window_backend.rect(node)
@@ -652,8 +1477,13 @@ def resolve_moment_post(window_backend: WindowBackend, win: Any, window_rect: Re
             continue
         if rect.right < window_rect.left + window_rect.width * 0.20:
             continue
-        name = clean_post_text(window_backend._safe_text(node))
         control_type = window_backend._control_type(node)
+        control_type_l = control_type.lower()
+        if control_type_l in {"window", "toolbar"}:
+            continue
+        if rect.width > window_rect.width * 0.96 and rect.height > window_rect.height * 0.45:
+            continue
+        name = clean_post_text(window_backend._safe_text(node))
         if not name and require_text:
             continue
         if name and len(name) < 2:
@@ -681,19 +1511,7 @@ def resolve_moment_post(window_backend: WindowBackend, win: Any, window_rect: Re
     if require_text:
         raise EasyMoneyError("已匹配头像，但 UIA 未能读取该动态正文；可先用 --text，或检查微信窗口/缩放")
 
-    fallback = Rect(
-        window_rect.left + window_rect.width * 0.20,
-        max(window_rect.top, avatar_center.y - 48),
-        window_rect.right - 16,
-        min(window_rect.bottom, avatar_center.y + 140),
-    )
-    return MomentPostResolution(
-        avatar_center=avatar_center,
-        body_frame=fallback,
-        action_point=Point(fallback.right - 40, fallback.bottom - 10),
-        text="",
-        source="fallback-geometry",
-    )
+    return fallback_post_from_avatar(window_rect, avatar_center)
 
 
 def resolve_send_point(action_point: Point, window_rect: Rect, config: CommentConfig) -> tuple[Point, str]:
@@ -1535,7 +2353,7 @@ def solve_fts_fallback(conn: sqlite3.Connection, question: str) -> Optional[Solv
 
 
 def solve_question_from_context(question: str, preferred_store: Optional[str] = None, context: str = "") -> Optional[SolvedQuestion]:
-    with open_knowledge_db(create=True) as conn:
+    with closing(open_knowledge_db(create=True)) as conn:
         store_id = resolve_store_id(conn, preferred_store)
         script_ids = guess_script_ids(conn, question, context)
         for solver in [
@@ -1553,7 +2371,7 @@ def solve_question_from_context(question: str, preferred_store: Optional[str] = 
 
 
 def rebuild_knowledge_index() -> None:
-    with open_knowledge_db(create=True) as conn:
+    with closing(open_knowledge_db(create=True)) as conn:
         if not db_table_exists(conn, "kb_fts"):
             print("当前 SQLite 不支持 FTS5，无法重建索引")
             return
@@ -1585,7 +2403,7 @@ def rebuild_knowledge_index() -> None:
 
 
 def print_knowledge_stats() -> None:
-    with open_knowledge_db(create=True) as conn:
+    with closing(open_knowledge_db(create=True)) as conn:
         print(f"知识库: {CONFIG_KB}")
         print(f"schema version: {conn.execute('PRAGMA user_version').fetchone()[0]}")
         for table in [
@@ -1609,7 +2427,7 @@ def print_knowledge_stats() -> None:
 
 
 def search_knowledge(keyword: str) -> None:
-    with open_knowledge_db(create=True) as conn:
+    with closing(open_knowledge_db(create=True)) as conn:
         rows: list[sqlite3.Row] = []
         if db_table_exists(conn, "kb_fts"):
             try:
@@ -1640,7 +2458,7 @@ def search_knowledge(keyword: str) -> None:
 
 
 def print_parsed_question(question: str, preferred_store: Optional[str]) -> None:
-    with open_knowledge_db(create=True) as conn:
+    with closing(open_knowledge_db(create=True)) as conn:
         script_ids = guess_script_ids(conn, question)
         store_id = resolve_store_id(conn, preferred_store)
         print(f"问题: {question}")
@@ -1673,7 +2491,7 @@ def learn_knowledge_from_clipboard() -> None:
         print("剪贴板为空")
         return
     signature = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    with open_knowledge_db(create=True) as conn:
+    with closing(open_knowledge_db(create=True)) as conn:
         row = conn.execute("SELECT id FROM posts WHERE content_signature=? LIMIT 1", (signature,)).fetchone()
         if row:
             print(f"剪贴板内容已存在 posts#{row['id']}")
@@ -1688,7 +2506,7 @@ def learn_knowledge_from_clipboard() -> None:
 
 
 def print_knowledge_history(title: str) -> None:
-    with open_knowledge_db(create=True) as conn:
+    with closing(open_knowledge_db(create=True)) as conn:
         rows = conn.execute("SELECT id, title, host_name, variant, created_at FROM scripts WHERE title LIKE ? ORDER BY created_at DESC LIMIT 20", (f"%{title}%",)).fetchall()
         if not rows:
             print(f"未找到剧本: {title}")
@@ -1702,7 +2520,7 @@ def print_knowledge_history(title: str) -> None:
 def set_character_gender(script_title: str, character_name: str, gender: str) -> bool:
     if gender not in {"男", "女"}:
         return False
-    with open_knowledge_db(create=True) as conn:
+    with closing(open_knowledge_db(create=True)) as conn:
         script = conn.execute("SELECT id FROM scripts WHERE title LIKE ? ORDER BY created_at DESC LIMIT 1", (f"%{script_title}%",)).fetchone()
         if not script:
             return False
@@ -1771,8 +2589,9 @@ def print_usage() -> None:
 {APP_NAME} {APP_VERSION}
 
 用法:
-  python easy_money_win.py locate
   python easy_money_win.py run [--interval N] [--pos x,y] [--index N] [--title 文本] [--id id]
+  python easy_money_win.py locate [--test-click]
+  python easy_money_win.py capture-info [--backend auto|dxgi|mss]
   python easy_money_win.py uia-dump [--max-depth N] [--buttons-only]
   python easy_money_win.py ax-dump [--max-depth N] [--buttons-only]
   python easy_money_win.py comment-locate
@@ -1786,7 +2605,7 @@ def print_usage() -> None:
   python easy_money_win.py user remove <name>
   python easy_money_win.py user list
   python easy_money_win.py user default <name>
-  python easy_money_win.py comment [--text 文本] [--solve-question|--doubao|--LLM [--vision]] [--noLocal] [--store 商家] --user [name] [--debug]
+  python easy_money_win.py comment [--text 文本] [--solve-question|--doubao|--LLM [--vision]] [--noLocal] [--store 商家] --user <用户头像模板名> [--debug]
   python easy_money_win.py llm ask "<问题>" [上下文]
   python easy_money_win.py doubao ask "<朋友圈正文>"
   python easy_money_win.py kb stats|search|ask|parse|rebuild|learn|history|set-gender ...
@@ -1800,9 +2619,32 @@ def parse_option_value(args: list[str], index: int, name: str) -> tuple[str, int
     return args[index + 1], index + 1
 
 
+def cmd_capture_info(args: list[str]) -> int:
+    backend_name: Optional[str] = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--backend":
+            backend_name, i = parse_option_value(args, i, "--backend")
+        i += 1
+    backend = WindowBackend()
+    win_rect = backend.moments_window_rect()
+    region = refresh_observation_region(win_rect)
+    capture = CaptureBackend(backend_name)
+    started = time.perf_counter()
+    frame = capture.grab(region)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    print(f"截图后端: {capture.backend}")
+    print(f"测试区域: {region.describe()}")
+    print(f"帧尺寸: {frame.width}x{frame.height}")
+    print(f"截图耗时: {elapsed_ms}ms")
+    capture.close()
+    return 0
+
+
 def cmd_uia_dump(args: list[str]) -> int:
     max_depth = 10
     buttons_only = False
+    settle_ms = 600
     i = 0
     while i < len(args):
         if args[i] == "--max-depth":
@@ -1810,31 +2652,83 @@ def cmd_uia_dump(args: list[str]) -> int:
             max_depth = max(1, min(int(value), 30))
         elif args[i] == "--buttons-only":
             buttons_only = True
+        elif args[i] == "--settle-ms":
+            value, i = parse_option_value(args, i, "--settle-ms")
+            settle_ms = max(0, int(value))
         i += 1
     backend = WindowBackend()
+    deadline = time.perf_counter() + settle_ms / 1000
     win = backend.moments_window()
-    backend.dump_tree(win, max_depth=max_depth, buttons_only=buttons_only)
+    while not buttons_only and time.perf_counter() < deadline:
+        if find_uia_list_items(backend, win, max_depth=max_depth):
+            break
+        time.sleep(0.12)
+        win = backend.moments_window()
+    _, found_sns_list, found_list_item = backend.dump_tree(win, max_depth=max_depth, buttons_only=buttons_only)
+    if not buttons_only and (not found_sns_list or not found_list_item):
+        print("\n提示: 当前 UIA 只暴露了朋友圈渲染壳，未暴露 sns_list/ListItem。")
+        print("      这通常是微信 UIA 树短暂未刷新或窗口焦点/渲染状态导致；稍等、重新激活朋友圈窗口或重新打开朋友圈后再 dump。")
     return 0
 
 
-def cmd_locate(args: list[str]) -> int:
-    no_click = "--no-click" in args
-    backend = WindowBackend()
+def click_button_by_title(
+    backend: WindowBackend,
+    root: Any,
+    input_backend: InputBackend,
+    title: str,
+    automation_id: Optional[str] = None,
+) -> Optional[Point]:
+    for btn in backend.find_buttons(root):
+        name = backend._safe_text(btn)
+        button_id = backend._automation_id(btn)
+        if title and title not in name:
+            continue
+        if automation_id and automation_id != button_id:
+            continue
+        rect = backend.rect(btn)
+        if not backend.click_control(btn, input_backend, prefer_coordinate=True):
+            return None
+        return rect.center if rect is not None else None
+    return None
+
+
+def refresh_point_from_saved_offset(backend: WindowBackend) -> Optional[Point]:
+    offset = load_point(CONFIG_REFRESH)
+    if offset is None:
+        return None
     win_rect = backend.moments_window_rect()
+    return Point(win_rect.left + offset.x, win_rect.top + offset.y)
+
+
+def cmd_locate(args: list[str]) -> int:
+    test_click = False
+    i = 0
+    while i < len(args):
+        if args[i] in {"--mouse", "--manual"}:
+            pass
+        elif args[i] == "--test-click":
+            test_click = True
+        i += 1
+
+    backend = WindowBackend()
     input_backend = InputBackend()
-    print(f"已找到朋友圈窗口: {win_rect.describe()}")
-    print("请将鼠标移动到刷新按钮上，3 秒后记录。")
+    win = backend.moments_window()
+    backend.activate(win)
+    win_rect = backend.rect(win)
+    if win_rect is None:
+        raise EasyMoneyError("无法读取朋友圈窗口位置")
+
+    print("手动标定刷新按钮位置：请将鼠标移到朋友圈顶部“刷新”按钮中心。")
     countdown()
-    pos = input_backend.position()
-    offset = Point(pos.x - win_rect.left, pos.y - win_rect.top)
-    save_point(CONFIG_REFRESH_OFFSET, offset)
-    print(f"鼠标位置: ({int(pos.x)}, {int(pos.y)})")
-    print(f"相对窗口偏移: ({int(offset.x)}, {int(offset.y)})")
-    print(f"已保存到: {CONFIG_REFRESH_OFFSET}")
-    if not no_click:
-        print("测试点击刷新按钮...")
-        input_backend.click(pos)
-    print("之后可运行: python easy_money_win.py run --interval 15")
+    point = input_backend.position()
+    offset = Point(point.x - win_rect.left, point.y - win_rect.top)
+    save_point(CONFIG_REFRESH, offset)
+    print(f"已定位刷新按钮: 鼠标位置 ({int(point.x)}, {int(point.y)})")
+    print(f"窗口相对偏移: dx={int(offset.x)}, dy={int(offset.y)}")
+    print(f"配置已保存: {CONFIG_REFRESH}")
+    if test_click:
+        input_backend.click(point, interval=0.0)
+        print("已执行测试点击")
     return 0
 
 
@@ -1862,9 +2756,10 @@ def cmd_run(args: list[str]) -> int:
         i += 1
     input_backend = InputBackend()
     backend = WindowBackend()
-    saved_offset = load_point(CONFIG_REFRESH_OFFSET)
-    if not any([target_pos, target_index is not None, target_title, target_id]) and saved_offset is None:
-        raise EasyMoneyError(f"未找到刷新按钮偏移，请先运行 locate: {CONFIG_REFRESH_OFFSET}")
+    if not any([target_pos, target_index is not None, target_title, target_id]):
+        target_pos = refresh_point_from_saved_offset(backend)
+        if target_pos is None:
+            raise EasyMoneyError("未找到刷新按钮坐标配置，请先运行 locate")
     print(f"自动刷新模式启动，间隔 {interval:g} 秒。按 Ctrl+C 退出。")
     while True:
         now = time.strftime("%H:%M:%S")
@@ -1890,16 +2785,12 @@ def cmd_run(args: list[str]) -> int:
                         break
                 if chosen is None:
                     print(f"[{now}] 未找到目标按钮，跳过")
-                elif backend.click_control(chosen, input_backend):
-                    print(f"[{now}] 已点击按钮 {backend._safe_text(chosen) or target_index}")
+                elif backend.click_control(chosen, input_backend, prefer_coordinate=True):
+                    rect = backend.rect(chosen)
+                    detail = f" @({int(rect.center.x)}, {int(rect.center.y)})" if rect else ""
+                    print(f"[{now}] 已点击按钮 {backend._safe_text(chosen) or target_index}{detail}")
                 else:
                     print(f"[{now}] 点击按钮失败")
-            else:
-                win_rect = backend.moments_window_rect()
-                assert saved_offset is not None
-                point = Point(win_rect.left + saved_offset.x, win_rect.top + saved_offset.y)
-                input_backend.click(point)
-                print(f"[{now}] 已点击 ({int(point.x)}, {int(point.y)})")
         except EasyMoneyError as exc:
             print(f"[{now}] {exc}")
         time.sleep(interval)
@@ -1986,6 +2877,8 @@ def cmd_avatar_template_locate(args: list[str]) -> int:
     print("请将鼠标移到目标用户头像中心。")
     countdown()
     pos = input_backend.position()
+    avatar_offset = Point(pos.x - win_rect.left, pos.y - win_rect.top)
+    save_point(CONFIG_AVATAR_OFFSET, avatar_offset)
     if name:
         path = named_template_path(name)
         save_avatar_template_at(pos, win_rect, path)
@@ -1996,11 +2889,13 @@ def cmd_avatar_template_locate(args: list[str]) -> int:
             config.default = name
         save_user_template_config(config)
         print(f"头像模板已保存: {path}")
+        print(f"头像中心偏移已保存: ({int(avatar_offset.x)}, {int(avatar_offset.y)}) -> {CONFIG_AVATAR_OFFSET}")
         if config.default == name:
             print("已设为默认模板")
     else:
         save_avatar_template_at(pos, win_rect, LEGACY_AVATAR_TEMPLATE)
         print(f"头像模板已保存: {LEGACY_AVATAR_TEMPLATE}")
+        print(f"头像中心偏移已保存: ({int(avatar_offset.x)}, {int(avatar_offset.y)}) -> {CONFIG_AVATAR_OFFSET}")
     return 0
 
 
@@ -2155,12 +3050,13 @@ def cmd_comment(args: list[str]) -> int:
     no_local = False
     preferred_store: Optional[str] = None
     debug = False
+    uia_debug = False
     save_post_image = False
     save_post_image_raw = False
     save_path: Optional[Path] = None
     click_post_image = False
     test_image_crop = False
-    rounds = 1
+    rounds = 30
 
     i = 0
     while i < len(args):
@@ -2199,6 +3095,8 @@ def cmd_comment(args: list[str]) -> int:
             preferred_store, i = parse_option_value(args, i, "--store")
         elif arg == "--debug":
             debug = True
+        elif arg == "--uia-debug":
+            uia_debug = True
         elif arg == "--save-post-image":
             save_post_image = True
         elif arg == "--raw":
@@ -2218,7 +3116,7 @@ def cmd_comment(args: list[str]) -> int:
         i += 1
 
     if not user_filter:
-        raise EasyMoneyError("comment 命令必须显式指定 --user [name]")
+        raise EasyMoneyError("comment 命令必须显式指定 --user <用户头像模板名>")
     if use_vision and not use_llm:
         raise EasyMoneyError("--vision 需要与 --LLM 一起使用")
     if not any([comment_text, solve_question, save_post_image, click_post_image, test_image_crop]):
@@ -2228,12 +3126,17 @@ def cmd_comment(args: list[str]) -> int:
     if not config and not any([save_post_image, click_post_image, test_image_crop]):
         raise EasyMoneyError("未找到评论配置，请先运行 comment-locate")
 
-    resolved_name, entry, template_path = resolve_user_template(user_name)
-    if template_path is None or not template_path.exists():
-        available = ", ".join(sorted(load_user_template_config().users.keys()))
-        raise EasyMoneyError(f"未找到用户头像模板: {user_name or '(default)'}" + (f"；可用: {available}" if available else ""))
-    match_mode = match_mode_override or normalized_avatar_match_mode(entry.matchMode if entry else None) or "center_square"
-    threshold = entry.threshold if entry and entry.threshold is not None else 0.72
+    requested_user = (user_name or "").strip()
+    if not requested_user:
+        raise EasyMoneyError("comment --user 需要提供用户头像模板名；可先运行 avatar-template-locate --name <用户>")
+    resolved_name, user_entry, template_path = resolve_user_template(requested_user)
+    if template_path is None or user_entry is None or not template_path.exists():
+        available = sorted(set(discover_user_photo_templates().keys()) | set(load_user_template_config().users.keys()))
+        suffix = f"；当前可用模板: {', '.join(available)}" if available else ""
+        raise EasyMoneyError(f"未找到用户头像模板: {requested_user}；请先运行 avatar-template-locate --name {requested_user}{suffix}")
+    match_mode = match_mode_override or normalized_avatar_match_mode(user_entry.matchMode) or "center_square"
+    threshold = user_entry.threshold if user_entry.threshold is not None else 0.72
+    avatar_matcher = AvatarMatcher(template_path, threshold)
 
     backend = WindowBackend()
     input_backend = InputBackend()
@@ -2245,23 +3148,80 @@ def cmd_comment(args: list[str]) -> int:
 
     avatar_center: Optional[Point] = None
     avatar_score = 0.0
+    last_attempt: Optional[AvatarMatchAttempt] = None
     last_error: Optional[Exception] = None
-    for _ in range(rounds):
+    refresh_button_center: Optional[Point] = refresh_point_from_saved_offset(backend)
+    if refresh_button_center is None:
+        raise EasyMoneyError("启用 --user 自动刷新需要先运行 locate 标定刷新按钮")
+    need_post_text = solve_question
+    for round_index in range(1, rounds + 1):
         try:
-            avatar_center, avatar_score = find_avatar_in_window(window_rect, template_path, threshold, match_mode)
+            if rounds > 1:
+                print(f"头像视觉匹配: 第 {round_index}/{rounds} 轮")
+            win = backend.moments_window()
+            current_window_rect = backend.rect(win)
+            if current_window_rect is None:
+                raise EasyMoneyError("无法读取朋友圈窗口位置")
+            window_rect = current_window_rect
+            last_attempt = avatar_matcher.match_in_window(window_rect, match_mode)
+            if last_attempt.center is None:
+                raise EasyMoneyError(
+                    f"未匹配到目标头像，模板={template_path} 阈值={threshold:.2f} "
+                    f"best={last_attempt.score:.3f}"
+                )
+            avatar_center = last_attempt.center
+            avatar_score = last_attempt.score
+            print(
+                "  头像匹配成功: "
+                f"user={resolved_name or requested_user} "
+                f"score={avatar_score:.3f} "
+                f"center=({int(avatar_center.x)}, {int(avatar_center.y)}) "
+                f"region={last_attempt.region.describe()} "
+                f"耗时={last_attempt.total_ms}ms "
+                f"(截屏={last_attempt.capture_ms}ms 转灰={last_attempt.convert_ms}ms 匹配={last_attempt.match_ms}ms)"
+            )
             break
         except Exception as exc:
             last_error = exc
-            refresh_offset = load_point(CONFIG_REFRESH_OFFSET)
-            if refresh_offset:
-                input_backend.click(Point(window_rect.left + refresh_offset.x, window_rect.top + refresh_offset.y))
-                time.sleep(0.6)
+            if round_index >= rounds:
+                print(f"  头像匹配失败: {exc}")
+                break
+            print(f"  头像匹配失败，执行刷新后继续: {exc}")
+            refresh_region = last_attempt.region if last_attempt is not None else refresh_observation_region(window_rect)
+            try:
+                baseline_fingerprint = quick_capture_fingerprint(avatar_matcher.capture, refresh_region)
+            except EasyMoneyError:
+                baseline_fingerprint = None
+            input_backend.click(refresh_button_center)
+            try:
+                wait_changed = wait_for_region_refresh(avatar_matcher.capture, refresh_region, baseline_fingerprint)
+            except EasyMoneyError:
+                wait_changed = False
+                time.sleep(COMMENT_REFRESH_WAIT_SECONDS)
+            print(
+                f"  已点击 locate 保存的刷新坐标: ({int(refresh_button_center.x)}, {int(refresh_button_center.y)})，"
+                f"{'检测到刷新变化' if wait_changed else f'等待 {int(COMMENT_REFRESH_WAIT_SECONDS * 1000)}ms'}"
+            )
     if avatar_center is None:
-        raise EasyMoneyError(str(last_error or "头像匹配失败"))
+        raise EasyMoneyError(f"{last_error or '头像视觉匹配失败'}；已尝试 {rounds} 轮，可用 --rounds N 调整")
 
-    need_text = solve_question
-    post = resolve_moment_post(backend, win, window_rect, avatar_center, require_text=need_text)
-    print(f"已匹配用户: {resolved_name or user_name or 'legacy'} score={avatar_score:.3f}")
+    avatar_matcher.capture._stop_dx_stream()
+    time.sleep(float(os.environ.get("EASYMONEY_UIA_AFTER_CAPTURE_DELAY", "0.02")))
+    fresh_win = backend.moments_window()
+    fresh_rect = backend.rect(fresh_win)
+    if fresh_rect is not None:
+        win = fresh_win
+        window_rect = fresh_rect
+    post = resolve_moment_post(
+        backend,
+        win,
+        window_rect,
+        avatar_center,
+        require_text=need_post_text,
+        capture=avatar_matcher.capture,
+        debug_uia=uia_debug,
+    )
+    print(f"已匹配用户模板: {resolved_name or requested_user} score={avatar_score:.3f}")
     print(f"头像中心: ({int(avatar_center.x)}, {int(avatar_center.y)})")
     print(f"动态定位: {post.source} frame={post.body_frame.describe()}")
     if post.text:
@@ -2323,19 +3283,46 @@ def cmd_comment(args: list[str]) -> int:
     if debug:
         input_backend.move_to(post.action_point)
         print(f"DEBUG: 操作按钮点 ({int(post.action_point.x)}, {int(post.action_point.y)})")
+        print("DEBUG: 打开评论方式: Tab+Enter")
         print(f"DEBUG: 发送点 [{send_method}] ({int(send_point.x)}, {int(send_point.y)})")
         print(f"DEBUG: 评论内容: {final_text}")
         return 0
 
-    input_backend.click(post.action_point)
-    time.sleep(0.25)
-    comment_point = Point(post.action_point.x + config.comment_from_action.x, post.action_point.y + config.comment_from_action.y)
-    input_backend.click(comment_point)
-    time.sleep(0.25)
-    paste_method = input_backend.paste_text(final_text)
-    time.sleep(0.12)
-    input_backend.click(send_point, clicks=3, interval=0.03)
-    print(f"已执行评论发送: {paste_method} | 发送点={send_method} ({int(send_point.x)}, {int(send_point.y)})")
+    send_flow_start = time.perf_counter()
+    step_start = time.perf_counter()
+    input_backend.click(post.action_point, interval=0.0)
+    action_click_ms = int((time.perf_counter() - step_start) * 1000)
+
+    step_start = time.perf_counter()
+    input_backend.press_sequence(["tab", "enter"])
+    comment_open_method = "Tab+Enter"
+    open_comment_ms = int((time.perf_counter() - step_start) * 1000)
+
+    step_start = time.perf_counter()
+    if input_backend.can_type_directly(final_text):
+        paste_method = input_backend.type_text_directly(final_text)
+    else:
+        paste_method = input_backend.paste_text(
+            final_text,
+            restore_clipboard=False,
+            before_paste_delay=0.0,
+            after_paste_delay=0.012,
+        )
+    paste_ms = int((time.perf_counter() - step_start) * 1000)
+
+    step_start = time.perf_counter()
+    input_backend.click(send_point, clicks=1, interval=0.0)
+    send_click_ms = int((time.perf_counter() - step_start) * 1000)
+    total_send_ms = int((time.perf_counter() - send_flow_start) * 1000)
+    print(
+        f"已执行评论发送: {paste_method} | 打开评论={comment_open_method} | "
+        f"发送点={send_method} ({int(send_point.x)}, {int(send_point.y)})"
+    )
+    print(
+        f"发送流程耗时: 总计={total_send_ms}ms | "
+        f"点操作={action_click_ms}ms | 打开评论={open_comment_ms}ms | "
+        f"粘贴={paste_ms}ms | 发送连点={send_click_ms}ms"
+    )
     return 0
 
 
@@ -2442,6 +3429,14 @@ def cmd_kb(args: list[str]) -> int:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     enable_dpi_awareness()
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in {"-h", "--help", "help"}:
@@ -2452,6 +3447,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     dispatch: dict[str, Callable[[list[str]], int]] = {
         "uia-dump": cmd_uia_dump,
         "ax-dump": cmd_uia_dump,
+        "capture-info": cmd_capture_info,
         "locate": cmd_locate,
         "run": cmd_run,
         "comment-locate": cmd_comment_locate,

@@ -1,4 +1,4 @@
-pywinauto>=0.6.8
+uiautomation>=2.0.29
 pyautogui>=0.9.54
 pyperclip>=1.8.2
 dxcam>=0.0.5

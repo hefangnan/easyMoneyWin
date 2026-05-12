@@ -1,6 +1,6 @@
 # easyMoney Windows Python 版
 
-`easy_money_win.py` 是 `easyMoney.swift` 的 Windows 第一版迁移。它优先保留常用工作流：微信朋友圈窗口定位、按 `locate` 保存的刷新按钮坐标自动刷新、用 DXGI 截图 + OpenCV 头像模板匹配定位目标动态、自动评论、LLM/豆包答题、SQLite 知识库查询。
+`easy_money_win.py` 是 `easyMoney.swift` 的 Windows 第一版迁移。它优先保留常用工作流：微信朋友圈窗口定位、按 `locate` 保存的刷新按钮坐标自动刷新、通过 UI Automation 读取朋友圈 `sns_list` 的第二条 `ListItem` 来匹配目标动态、自动评论、LLM/豆包答题、SQLite 知识库查询。
 
 这不是 Swift 版的逐行复刻。macOS 的 `AXUIElement`、`CGEvent`、`ScreenCaptureKit`、`Vision`、`CoreML` 在 Windows 上分别替换为 UI Automation、Win32 输入、DXGI Desktop Duplication（`dxcam`，`mss` 兜底）、可选 OpenCV/YOLO。第一版不默认启用 OCR，也不迁移 CoreML。
 
@@ -29,8 +29,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 - `EASYMONEY_CAPTURE_BACKEND=dxgi`：强制 DXGI，初始化失败会报错
 - `EASYMONEY_CAPTURE_BACKEND=mss`：强制旧截图后端
 - `EASYMONEY_DXGI_OUTPUT=0`：选择 DXGI 输出编号，多显示器时可调整
-- `EASYMONEY_AVATAR_STREAM=1`：头像匹配默认开启 DXGI 流采帧；设为 `0` 可退回逐次截图
-- `EASYMONEY_DXGI_STREAM_FPS=240`：头像匹配流采帧目标帧率，只在 DXGI 后端生效
+- `EASYMONEY_DXGI_STREAM_FPS=240`：DXGI 流采帧目标帧率，只在 DXGI 后端生效
 
 ## 配置文件位置
 
@@ -38,13 +37,9 @@ Windows 版使用 `Path.home()`，并尽量兼容 Swift 版的文件名：
 
 - `%USERPROFILE%\.wechat_comment_config`
 - `%USERPROFILE%\.wechat_refresh_offset`
-- `%USERPROFILE%\.wechat_avatar_tpl.png`
-- `%USERPROFILE%\.wechat_avatar_offset`
-- `%USERPROFILE%\.wechat_user_templates.json`
 - `%USERPROFILE%\.wechat_kb.sqlite`
 - `%USERPROFILE%\.easyMoney.env`
 - `%USERPROFILE%\.easyMoney\doubaotext-prefix-cache.json`
-- `%USERPROFILE%\.easyMoney\userPhoto\用户名.png`
 
 如果你已有 macOS 版知识库，可把 `~/.wechat_kb.sqlite` 复制到 Windows 的 `%USERPROFILE%\.wechat_kb.sqlite`。
 
@@ -73,15 +68,15 @@ EASYMONEY_LLM_TIMEOUT=18
 
 ```powershell
 python .\easy_money_win.py uia-dump --buttons-only
+python .\easy_money_win.py uia-dump
 python .\easy_money_win.py locate
 python .\easy_money_win.py comment-locate
-python .\easy_money_win.py avatar-template-locate --name 方南 --set-default
 python .\easy_money_win.py comment --text "好看！" --user 方南 --debug
 ```
 
 `locate` 会手动标定顶部“刷新”按钮，并保存窗口相对坐标到 `%USERPROFILE%\.wechat_refresh_offset`。运行后把鼠标移到刷新按钮中心，倒计时结束时脚本会保存坐标；后续刷新不再从 UIA 里找刷新按钮。
 
-`avatar-template-locate --name 方南` 会把鼠标所在头像中心附近的模板保存到 `%USERPROFILE%\.easyMoney\userPhoto\方南.png`，并同时保存头像中心偏移。后续 `--user 方南` 表示用这个头像模板做视觉匹配；默认走 `center_square` 窄区域匹配，必要时可加 `--avatar-wide` 扫左侧更大区域。
+`uia-dump` 默认只展示朋友圈 `sns_list` 下第二条 `ListItem`，用于确认微信当前暴露出来的正文内容。后续 `--user 方南` 表示脚本会读取第二条 `ListItem`，并检查它的开头是否匹配 `方南`；不再需要保存用户图片或视觉模板。
 
 确认 `--debug` 定位正确后，再执行真实评论：
 
@@ -137,5 +132,5 @@ EASYMONEY_YOLO_CONF=0.25
 
 - 建议 Windows 缩放先用 100% 或 125%。脚本会启用 DPI aware，但微信 UI 与截图坐标仍可能受系统缩放影响。
 - 如果 UIA 读不到朋友圈正文，`comment --text` 仍可用；`--solve-question`、`--doubao`、`--LLM` 需要正文时会提示失败。
-- 如果头像匹配失败，先确认 `avatar-template-locate --name 用户名` 保存的是头像中心，不是昵称或正文；也可以运行 `comment --text "测试" --user 用户名 --avatar-wide --debug` 扩大搜索范围。
+- 如果用户匹配失败，先运行 `python .\easy_money_win.py uia-dump`，确认第二条 `ListItem` 的开头就是你传给 `--user` 的用户名前缀。
 - `--debug` 不会发送评论，只移动鼠标并打印定位信息。

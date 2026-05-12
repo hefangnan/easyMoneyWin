@@ -1,6 +1,8 @@
+import io
 import os
 import tempfile
 import unittest
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 
 import easy_money_win as em
@@ -64,7 +66,7 @@ class EasyMoneyWinTests(unittest.TestCase):
             old_db = em.CONFIG_KB
             try:
                 em.CONFIG_KB = Path(tmp) / ".wechat_kb.sqlite"
-                with em.open_knowledge_db(create=True) as conn:
+                with closing(em.open_knowledge_db(create=True)) as conn:
                     conn.execute(
                         "INSERT INTO scripts(title, normalized_title) VALUES (?, ?)",
                         ("测试剧本", em.normalize_text("测试剧本")),
@@ -87,6 +89,161 @@ class EasyMoneyWinTests(unittest.TestCase):
             finally:
                 em.CONFIG_KB = old_db
 
+    def test_comment_aborts_when_window_rect_unavailable_before_refresh(self):
+        old_window_backend = em.WindowBackend
+        old_input_backend = em.InputBackend
+        old_refresh_point = em.refresh_point_from_saved_offset
+        clicks: list[em.Point] = []
+
+        class FakeWindowBackend:
+            def __init__(self) -> None:
+                self.rect_calls = 0
+
+            def moments_window(self) -> object:
+                return object()
+
+            def activate(self, win: object) -> None:
+                pass
+
+            def rect(self, win: object) -> em.Rect | None:
+                self.rect_calls += 1
+                if self.rect_calls == 1:
+                    return em.Rect(0, 0, 400, 800)
+                return None
+
+        class FakeInputBackend:
+            def click(self, point: em.Point) -> None:
+                clicks.append(point)
+
+        try:
+            em.WindowBackend = FakeWindowBackend
+            em.InputBackend = FakeInputBackend
+            em.refresh_point_from_saved_offset = lambda backend: em.Point(184, 186)
+
+            with redirect_stdout(io.StringIO()):
+                with self.assertRaises(em.WindowPositionUnavailable):
+                    em.cmd_comment(["--text", "1", "--user", "fn", "--rounds", "2"])
+
+            self.assertEqual(clicks, [])
+        finally:
+            em.WindowBackend = old_window_backend
+            em.InputBackend = old_input_backend
+            em.refresh_point_from_saved_offset = old_refresh_point
+
+    def test_comment_sends_with_tab_shortcut_after_typing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_comment_config = em.CONFIG_COMMENT
+            old_window_backend = em.WindowBackend
+            old_input_backend = em.InputBackend
+            old_refresh_point = em.refresh_point_from_saved_offset
+            old_resolve_second = em.resolve_second_uia_list_item_post
+            events: list[tuple[str, object]] = []
+
+            class FakeWindowBackend:
+                def moments_window(self) -> object:
+                    return object()
+
+                def activate(self, win: object) -> None:
+                    events.append(("activate", None))
+
+                def rect(self, win: object) -> em.Rect:
+                    return em.Rect(0, 0, 400, 800)
+
+            class FakeInputBackend:
+                def click(self, point: em.Point, clicks: int = 1, interval: float = 0.04) -> None:
+                    events.append(("click", (int(point.x), int(point.y), clicks)))
+
+                def press_sequence(self, keys, gap: float = 0.0) -> None:
+                    events.append(("press_sequence", tuple(keys)))
+
+                def prepare_key_sequence(self, keys) -> None:
+                    events.append(("prepare_key_sequence", tuple(keys)))
+
+                def press_sequence_atomic(self, keys) -> None:
+                    events.append(("press_sequence_atomic", tuple(keys)))
+
+                def can_type_directly(self, text: str) -> bool:
+                    return True
+
+                def type_text_directly(self, text: str) -> str:
+                    events.append(("type", text))
+                    return "直接键盘输入"
+
+            try:
+                root = Path(tmp)
+                em.CONFIG_COMMENT = root / ".wechat_comment_config"
+                em.save_comment_config(
+                    em.CommentConfig(
+                        comment_from_action=em.Point(-66, -3),
+                        send_x_ratio=0.859375,
+                        send_from_action=em.Point(-33, 99),
+                    )
+                )
+                em.WindowBackend = FakeWindowBackend
+                em.InputBackend = FakeInputBackend
+                em.refresh_point_from_saved_offset = lambda backend: em.Point(153, 43)
+                em.resolve_second_uia_list_item_post = lambda *args, **kwargs: em.UIAListItemResolution(
+                    item_index=1,
+                    body_frame=em.Rect(80, 100, 340, 170),
+                    action_point=em.Point(300, 160),
+                    text="fn post",
+                    expected_user_id="fn",
+                    detected_prefix="fn",
+                    elapsed_ms=3,
+                )
+
+                with redirect_stdout(io.StringIO()):
+                    em.cmd_comment(["--text", "1", "--user", "fn", "--rounds", "1"])
+
+                self.assertEqual(events[-6:], [
+                    ("prepare_key_sequence", ("tab", "enter")),
+                    ("prepare_key_sequence", ("tab", "tab", "tab", "enter")),
+                    ("click", (300, 160, 1)),
+                    ("press_sequence_atomic", ("tab", "enter")),
+                    ("type", "1"),
+                    ("press_sequence_atomic", ("tab", "tab", "tab", "enter")),
+                ])
+                self.assertEqual([event for event in events if event[0] == "click"], [("click", (300, 160, 1))])
+            finally:
+                em.CONFIG_COMMENT = old_comment_config
+                em.WindowBackend = old_window_backend
+                em.InputBackend = old_input_backend
+                em.refresh_point_from_saved_offset = old_refresh_point
+                em.resolve_second_uia_list_item_post = old_resolve_second
+
+    def test_capture_backend_falls_back_to_mss_for_dxgi_invalid_region(self):
+        backend = object.__new__(em.CaptureBackend)
+        backend.backend = "dxgi"
+        backend._allow_mss_fallback = True
+        backend._dx_stream_region = None
+        backend.mss_mod = object()
+
+        class FakeDxCamera:
+            is_capturing = False
+
+            def start(self, *args, **kwargs) -> None:
+                raise ValueError("Invalid Region: Region should be in 1920x1080")
+
+            def stop(self) -> None:
+                pass
+
+        class FakeShot:
+            width = 4
+            height = 3
+            rgb = bytes([10, 20, 30] * 12)
+
+        class FakeSct:
+            def grab(self, region: dict[str, int]) -> FakeShot:
+                self.region = region
+                return FakeShot()
+
+        backend._dx_camera = FakeDxCamera()
+        backend._sct = FakeSct()
+
+        frame = backend.grab_stream(em.Rect(-20, 10, 20, 13))
+
+        self.assertEqual((frame.width, frame.height), (4, 3))
+        self.assertEqual(backend._sct.region["left"], -20)
 
 if __name__ == "__main__":
     unittest.main()

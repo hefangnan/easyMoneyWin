@@ -1,0 +1,13 @@
+.downloads/
+.python/
+.tools/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyd
+*.dll
+*.pdb
+*.obj
+*.lib
+*.exp
+*.ilk

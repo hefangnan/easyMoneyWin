@@ -84,36 +84,12 @@ python .\easy_money_win.py comment --text "好看！" --user 方南 --debug
 python .\easy_money_win.py comment --text "好看！" --user 方南
 ```
 
-默认使用快捷键链路：点击动态右下角操作按钮后，通过 `Tab+Enter` 打开评论输入框，再通过 `Tab+Tab+Tab+Enter` 发送。评论文本优先走 `KEYEVENTF_UNICODE` 直接输入，逻辑对应 Swift 版的 `keyboardSetUnicodeString`；只有超长文本或控制字符等不适合直输的内容才回退剪贴板。脚本发送评论时不会恢复原剪贴板内容。
+默认使用分段链路：点击动态右下角操作按钮、通过 `Tab+Enter` 打开评论输入框、输入评论文本、再按已标定的发送按钮坐标执行鼠标点击发送。日志会分别输出 `点操作`、`打开评论`、`输入`、`发送点击` 四段耗时。评论文本优先走 `KEYEVENTF_UNICODE` 直接输入，逻辑对应 Swift 版的 `keyboardSetUnicodeString`；只有超长文本或控制字符等不适合直输的内容才回退剪贴板。脚本发送评论时不会恢复原剪贴板内容。
 
-默认启用极限快捷键链路：把“移动到操作按钮 + 点击 + Tab+Enter + Unicode 文本输入 + Tab+Tab+Tab+Enter”全部合并为一次 `SendInput` 调用。它不走评论菜单坐标点击、不走发送按钮点击，但很依赖微信窗口响应时机。
+如需对比纯快捷键发送链路，可以显式指定 `--submit-mode keys` 或 `--submit-keys tab,tab,tab,enter`。
 
 ```powershell
 python .\easy_money_win.py comment --text "好看！" --user 方南
-```
-
-如果同目录存在 `easy_money_input.dll`，脚本会优先使用 C++ 原生热路径，进一步减少 Python/ctypes 组装事件的开销。构建方式：
-
-```powershell
-.\build_native_helper.bat
-```
-
-构建需要 Visual Studio Build Tools 的 `cl.exe`，或 MinGW-w64 的 `g++.exe`。想临时禁用 C++ 热路径可设置：
-
-```powershell
-$env:EASYMONEY_DISABLE_NATIVE_INPUT="1"
-```
-
-C++ 热路径默认用 `SetCursorPos` 移动鼠标，再用一次 `SendInput` 发送点击和快捷键。若要对比“鼠标移动也塞进 SendInput”的旧模式：
-
-```powershell
-$env:EASYMONEY_NATIVE_MOVE_MODE="sendinput"
-```
-
-如果需要回退到分段快捷键链路，可以关闭：
-
-```powershell
-$env:EASYMONEY_FUSE_ALL_INPUTS="0"
 ```
 
 如需实验坐标点击打开评论菜单，可以显式指定：
@@ -122,7 +98,7 @@ $env:EASYMONEY_FUSE_ALL_INPUTS="0"
 python .\easy_money_win.py comment --text "好看！" --user 方南 --open-click
 ```
 
-如需实验坐标点击发送，可以显式指定：
+如需显式指定坐标点击发送，可以使用：
 
 ```powershell
 python .\easy_money_win.py comment --text "好看！" --user 方南 --submit-click

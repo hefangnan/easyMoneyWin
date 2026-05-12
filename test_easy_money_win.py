@@ -262,9 +262,15 @@ class EasyMoneyWinTests(unittest.TestCase):
             old_refresh_point = em.refresh_point_from_saved_offset
             old_resolve_second = em.resolve_second_uia_list_item_post
             events: list[tuple[str, object]] = []
+            window_backends: list[object] = []
 
             class FakeWindowBackend:
+                def __init__(self) -> None:
+                    self.moments_window_calls = 0
+                    window_backends.append(self)
+
                 def moments_window(self) -> object:
+                    self.moments_window_calls += 1
                     return object()
 
                 def activate(self, win: object) -> None:
@@ -328,6 +334,7 @@ class EasyMoneyWinTests(unittest.TestCase):
                     ("press_sequence_atomic", ("tab", "tab", "tab", "enter")),
                 ])
                 self.assertEqual([event for event in events if event[0] == "click"], [("click", (300, 160, 1))])
+                self.assertEqual(window_backends[0].moments_window_calls, 1)
             finally:
                 em.CONFIG_COMMENT = old_comment_config
                 em.WindowBackend = old_window_backend

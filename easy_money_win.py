@@ -3018,12 +3018,16 @@ def cmd_comment(args: list[str]) -> int:
 
     post: Optional[MomentPostResolution] = None
     last_error: Optional[Exception] = None
-    refresh_button_center: Optional[Point] = refresh_point_from_saved_offset(backend)
+    refresh_offset = load_point(CONFIG_REFRESH)
+    refresh_button_center = (
+        Point(window_rect.left + refresh_offset.x, window_rect.top + refresh_offset.y)
+        if refresh_offset is not None
+        else None
+    )
     refresh_capture: Optional[CaptureBackend] = None
     for round_index in range(1, rounds + 1):
         try:
             print(f"[{current_timestamp_ms()}] UIA用户匹配: 第 {round_index}/{rounds} 轮")
-            win = backend.moments_window()
             current_window_rect = backend.rect(win)
             if current_window_rect is None:
                 raise WindowPositionUnavailable("无法读取朋友圈窗口位置")
@@ -3089,10 +3093,8 @@ def cmd_comment(args: list[str]) -> int:
         raise EasyMoneyError(f"{last_error or 'UIA用户匹配失败'}；已尝试 {rounds} 轮，可用 --rounds N 调整")
 
     time.sleep(float(os.environ.get("EASYMONEY_UIA_AFTER_CAPTURE_DELAY", "0.02")))
-    fresh_win = backend.moments_window()
-    fresh_rect = backend.rect(fresh_win)
+    fresh_rect = backend.rect(win)
     if fresh_rect is not None:
-        win = fresh_win
         window_rect = fresh_rect
     print(f"已匹配用户: {requested_user}")
     print(f"动态定位: {post.source} frame={post.body_frame.describe()}")

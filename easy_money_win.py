@@ -34,8 +34,18 @@ COMMENT_REFRESH_IDLE_SECONDS = 0.003
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+DIRECT_TEXT_ENTRY_MAX_UTF16_UNITS = 512
+DIRECT_TEXT_ENTRY_CHUNK_UTF16_UNITS = 64
+MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_VIRTUALDESK = 0x4000
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
 ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
 
 
@@ -212,6 +222,7 @@ class UIAListItemResolution:
 
 
 HOME = Path.home()
+SCRIPT_DIR = Path(__file__).resolve().parent
 EASYMONEY_DIR = HOME / ".easyMoney"
 CONFIG_REFRESH = HOME / ".wechat_refresh_offset"
 CONFIG_COMMENT = HOME / ".wechat_comment_config"
@@ -221,6 +232,7 @@ CONFIG_KB = HOME / ".wechat_kb.sqlite"
 CONFIG_PREFIX_CACHE = EASYMONEY_DIR / "doubaotext-prefix-cache.json"
 ACTION_TEMPLATE = HOME / ".wechat_action_tpl.png"
 DEBUG_DIR = Path(os.environ.get("EASYMONEY_DEBUG_DIR", str(HOME / "test")))
+NATIVE_INPUT_DLL = SCRIPT_DIR / "easy_money_input.dll"
 
 
 def enable_dpi_awareness() -> None:
@@ -349,12 +361,35 @@ class InputBackend:
         self.native = os.name == "nt"
         self.user32 = ctypes.windll.user32 if self.native else None
         self._key_sequence_cache: dict[tuple[str, ...], tuple[int, Any]] = {}
+        self._vk_event_cache: dict[int, tuple[INPUT, INPUT]] = {}
+        self._mouse_click_cache: dict[int, tuple[INPUT, ...]] = {}
+        self._virtual_screen_metrics: Optional[tuple[int, int, int, int]] = None
+        self._native_input_helper = None
         if self.user32 is not None:
             try:
                 self.user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
                 self.user32.SendInput.restype = wintypes.UINT
             except Exception:
                 pass
+            self._native_input_helper = self._load_native_input_helper()
+
+    def _load_native_input_helper(self) -> Any:
+        if os.environ.get("EASYMONEY_DISABLE_NATIVE_INPUT", "0").strip().lower() in {"1", "true", "yes", "on"}:
+            return None
+        if not NATIVE_INPUT_DLL.exists():
+            return None
+        try:
+            dll = ctypes.CDLL(str(NATIVE_INPUT_DLL))
+            move_mode = os.environ.get("EASYMONEY_NATIVE_MOVE_MODE", "setpos").strip().lower()
+            if move_mode in {"sendinput", "absolute", "input"}:
+                func = dll.easy_money_send_comment_default
+            else:
+                func = dll.easy_money_send_comment_setpos
+            func.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p)
+            func.restype = ctypes.c_int
+            return func
+        except Exception:
+            return None
 
     @staticmethod
     def _vk(key: str) -> int:
@@ -411,6 +446,97 @@ class InputBackend:
                     return
         self.press_sequence(key_tuple)
 
+    def _key_input_events_for_vk(self, vk: int) -> tuple[INPUT, INPUT]:
+        cached = self._vk_event_cache.get(vk)
+        if cached is not None:
+            return cached
+        down = INPUT()
+        down.type = INPUT_KEYBOARD
+        down.union.ki = KEYBDINPUT(vk, 0, 0, 0, 0)
+        up = INPUT()
+        up.type = INPUT_KEYBOARD
+        up.union.ki = KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, 0)
+        cached = (down, up)
+        self._vk_event_cache[vk] = cached
+        return cached
+
+    @staticmethod
+    def _unicode_input_events_for_unit(unit: int) -> list[INPUT]:
+        down = INPUT()
+        down.type = INPUT_KEYBOARD
+        down.union.ki = KEYBDINPUT(0, unit, KEYEVENTF_UNICODE, 0, 0)
+        up = INPUT()
+        up.type = INPUT_KEYBOARD
+        up.union.ki = KEYBDINPUT(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
+        return [down, up]
+
+    def _mouse_click_input_events(self, clicks: int = 1) -> tuple[INPUT, ...]:
+        cached = self._mouse_click_cache.get(clicks)
+        if cached is not None:
+            return cached
+        events: list[INPUT] = []
+        for _ in range(clicks):
+            down = INPUT()
+            down.type = INPUT_MOUSE
+            down.union.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, 0)
+            up = INPUT()
+            up.type = INPUT_MOUSE
+            up.union.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, 0)
+            events.extend([down, up])
+        cached = tuple(events)
+        self._mouse_click_cache[clicks] = cached
+        return cached
+
+    def _get_virtual_screen_metrics(self) -> tuple[int, int, int, int]:
+        if self._virtual_screen_metrics is not None:
+            return self._virtual_screen_metrics
+        left = self.user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        top = self.user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        width = max(1, self.user32.GetSystemMetrics(SM_CXVIRTUALSCREEN))
+        height = max(1, self.user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+        self._virtual_screen_metrics = (left, top, width, height)
+        return self._virtual_screen_metrics
+
+    def _absolute_mouse_coords(self, point: Point) -> tuple[int, int]:
+        left, top, width, height = self._get_virtual_screen_metrics()
+        x, y = point.rounded()
+        dx = int(round((x - left) * 65535 / max(width - 1, 1)))
+        dy = int(round((y - top) * 65535 / max(height - 1, 1)))
+        return max(0, min(65535, dx)), max(0, min(65535, dy))
+
+    def _mouse_move_input_event(self, point: Point) -> Optional[INPUT]:
+        if not (self.native and self.user32 is not None):
+            return None
+        dx, dy = self._absolute_mouse_coords(point)
+        event = INPUT()
+        event.type = INPUT_MOUSE
+        event.union.mi = MOUSEINPUT(dx, dy, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, 0, 0)
+        return event
+
+    def _send_input_events(self, events: list[INPUT]) -> bool:
+        if not events or not (self.native and self.user32 is not None):
+            return False
+        array_type = INPUT * len(events)
+        event_array = array_type(*events)
+        sent = self.user32.SendInput(len(events), event_array, ctypes.sizeof(INPUT))
+        return sent == len(events)
+
+    def click_and_press_sequence_atomic(self, point: Point, keys: Iterable[str]) -> None:
+        key_tuple = tuple(keys)
+        if not key_tuple:
+            self.click(point, interval=0.0)
+            return
+        if self.native and self.user32 is not None:
+            move = self._mouse_move_input_event(point)
+            events = ([move] if move is not None else [])
+            events.extend(self._mouse_click_input_events(1))
+            for key in key_tuple:
+                events.extend(self._key_input_events_for_vk(self._vk(key)))
+            if self._send_input_events(events):
+                return
+        self.click(point, interval=0.0)
+        self.press_sequence_atomic(key_tuple)
+
     def position(self) -> Point:
         if self.native and self.user32 is not None:
             point = wintypes.POINT()
@@ -424,19 +550,7 @@ class InputBackend:
         if self.native and self.user32 is not None:
             self.user32.SetCursorPos(x, y)
             if interval <= 0:
-                events: list[INPUT] = []
-                for _ in range(clicks):
-                    down = INPUT()
-                    down.type = INPUT_MOUSE
-                    down.union.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, 0)
-                    up = INPUT()
-                    up.type = INPUT_MOUSE
-                    up.union.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, 0)
-                    events.extend([down, up])
-                array_type = INPUT * len(events)
-                event_array = array_type(*events)
-                sent = self.user32.SendInput(len(events), event_array, ctypes.sizeof(INPUT))
-                if sent == len(events):
+                if self._send_input_events(self._mouse_click_input_events(clicks)):
                     return
             for index in range(clicks):
                 self.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
@@ -500,12 +614,137 @@ class InputBackend:
     def can_type_directly(text: str) -> bool:
         return bool(text) and text.isascii() and all(ch.isalnum() or ch == " " for ch in text)
 
+    @staticmethod
+    def _utf16_units(text: str) -> list[int]:
+        data = text.encode("utf-16-le", errors="surrogatepass")
+        return [data[index] | (data[index + 1] << 8) for index in range(0, len(data), 2)]
+
+    @staticmethod
+    def can_type_unicode_directly(text: str) -> bool:
+        if not text:
+            return False
+        units = len(text.encode("utf-16-le", errors="surrogatepass")) // 2
+        if units <= 0 or units > DIRECT_TEXT_ENTRY_MAX_UTF16_UNITS:
+            return False
+        return all(ord(ch) >= 32 and ch not in "\r\n\t" for ch in text)
+
+    def can_type_text_directly(self, text: str) -> bool:
+        if self.native and self.user32 is not None:
+            return self.can_type_unicode_directly(text)
+        return self.can_type_directly(text)
+
+    def type_unicode_text_directly(self, text: str) -> str:
+        if not (self.native and self.user32 is not None):
+            raise EasyMoneyError("当前平台不支持 Unicode 直接输入")
+        if not self.can_type_unicode_directly(text):
+            raise EasyMoneyError("当前文本不适合 Unicode 直接输入")
+        units = self._utf16_units(text)
+        chunk_size = max(1, DIRECT_TEXT_ENTRY_CHUNK_UTF16_UNITS)
+        for offset in range(0, len(units), chunk_size):
+            events: list[INPUT] = []
+            for unit in units[offset : offset + chunk_size]:
+                down = INPUT()
+                down.type = INPUT_KEYBOARD
+                down.union.ki = KEYBDINPUT(0, unit, KEYEVENTF_UNICODE, 0, 0)
+                up = INPUT()
+                up.type = INPUT_KEYBOARD
+                up.union.ki = KEYBDINPUT(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0)
+                events.extend([down, up])
+            array_type = INPUT * len(events)
+            event_array = array_type(*events)
+            sent = self.user32.SendInput(len(events), event_array, ctypes.sizeof(INPUT))
+            if sent != len(events):
+                raise EasyMoneyError("Unicode 直接输入失败")
+        return "Unicode直接输入"
+
+    def type_text_and_press_keys_directly(self, text: str, keys: Iterable[str]) -> str:
+        if not (self.native and self.user32 is not None):
+            raise EasyMoneyError("当前平台不支持 Unicode 直接输入")
+        if not self.can_type_unicode_directly(text):
+            raise EasyMoneyError("当前文本不适合 Unicode 直接输入")
+        key_tuple = tuple(keys)
+        events: list[INPUT] = []
+        for unit in self._utf16_units(text):
+            events.extend(self._unicode_input_events_for_unit(unit))
+        for key in key_tuple:
+            events.extend(self._key_input_events_for_vk(self._vk(key)))
+        if not self._send_input_events(events):
+            raise EasyMoneyError("Unicode 直接输入 + 快捷键发送失败")
+        return "Unicode直接输入+快捷键发送"
+
+    def click_press_text_press_atomic(
+        self,
+        point: Point,
+        open_keys: Iterable[str],
+        text: str,
+        submit_keys: Iterable[str],
+    ) -> str:
+        if not (self.native and self.user32 is not None):
+            raise EasyMoneyError("当前平台不支持合并输入事件")
+        if not self.can_type_unicode_directly(text):
+            raise EasyMoneyError("当前文本不适合 Unicode 直接输入")
+        open_key_tuple = tuple(open_keys)
+        submit_key_tuple = tuple(submit_keys)
+        if (
+            self._native_input_helper is not None
+            and open_key_tuple == ("tab", "enter")
+            and submit_key_tuple == ("tab", "tab", "tab", "enter")
+        ):
+            x, y = point.rounded()
+            result = self._native_input_helper(int(x), int(y), text)
+            if result == 0:
+                return "C++合并输入事件"
+            raise EasyMoneyError(f"C++ 合并输入事件失败: code={result}")
+        dx, dy = self._absolute_mouse_coords(point)
+        open_vks = [self._vk(key) for key in open_key_tuple]
+        submit_vks = [self._vk(key) for key in submit_key_tuple]
+        utf16_units = self._utf16_units(text)
+        event_count = 3 + (len(open_vks) * 2) + (len(utf16_units) * 2) + (len(submit_vks) * 2)
+        array_type = INPUT * event_count
+        event_array = array_type()
+        index = 0
+
+        def add_mouse(mouse_dx: int, mouse_dy: int, flags: int) -> None:
+            nonlocal index
+            event_array[index].type = INPUT_MOUSE
+            event_array[index].union.mi = MOUSEINPUT(mouse_dx, mouse_dy, 0, flags, 0, 0)
+            index += 1
+
+        def add_keyboard(vk: int, scan: int, flags: int) -> None:
+            nonlocal index
+            event_array[index].type = INPUT_KEYBOARD
+            event_array[index].union.ki = KEYBDINPUT(vk, scan, flags, 0, 0)
+            index += 1
+
+        add_mouse(dx, dy, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK)
+        add_mouse(0, 0, MOUSEEVENTF_LEFTDOWN)
+        add_mouse(0, 0, MOUSEEVENTF_LEFTUP)
+        for vk in open_vks:
+            add_keyboard(vk, 0, 0)
+            add_keyboard(vk, 0, KEYEVENTF_KEYUP)
+        for unit in utf16_units:
+            add_keyboard(0, unit, KEYEVENTF_UNICODE)
+            add_keyboard(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+        for vk in submit_vks:
+            add_keyboard(vk, 0, 0)
+            add_keyboard(vk, 0, KEYEVENTF_KEYUP)
+
+        sent = self.user32.SendInput(event_count, event_array, ctypes.sizeof(INPUT))
+        if sent != event_count:
+            raise EasyMoneyError("合并点操作 + 打开评论 + 输入 + 发送快捷键失败")
+        return "合并输入事件"
+
     def type_text_directly(self, text: str, interval: float = 0.0) -> str:
-        if not self.can_type_directly(text):
+        if not self.can_type_text_directly(text):
             raise EasyMoneyError("当前文本不适合直接键盘输入")
         if self.native and self.user32 is not None:
-            self.press_sequence(text, gap=interval)
-            return "直接键盘输入"
+            try:
+                return self.type_unicode_text_directly(text)
+            except EasyMoneyError:
+                if not self.can_type_directly(text):
+                    raise
+                self.press_sequence(text, gap=interval)
+                return "直接键盘输入"
         self.pyautogui.write(text, interval=interval)
         return "直接键盘输入"
 
@@ -533,6 +772,37 @@ class InputBackend:
             except Exception:
                 pass
         return "剪贴板粘贴"
+
+
+def parse_key_sequence_text(raw: str, option_name: str = "key sequence") -> tuple[str, ...]:
+    text = raw.strip()
+    if not text:
+        raise EasyMoneyError(f"{option_name} 不能为空")
+    parts = [part.strip().lower() for part in re.split(r"[\s,]+", text) if part.strip()]
+    if not parts:
+        raise EasyMoneyError(f"{option_name} 不能为空")
+    valid_names = {"tab", "enter", "return", "esc", "escape", "ctrl", "control", "shift", "alt", "space"}
+    for part in parts:
+        if part not in valid_names and len(part) != 1:
+            raise EasyMoneyError(f"不支持的按键: {part}")
+    return tuple(parts)
+
+
+def format_key_sequence(keys: Iterable[str]) -> str:
+    labels = {
+        "tab": "Tab",
+        "enter": "Enter",
+        "return": "Enter",
+        "esc": "Esc",
+        "escape": "Esc",
+        "ctrl": "Ctrl",
+        "control": "Ctrl",
+        "shift": "Shift",
+        "alt": "Alt",
+        "space": "Space",
+        " ": "Space",
+    }
+    return "+".join(labels.get(key.lower(), key.upper() if len(key) == 1 else key) for key in keys)
 
 
 class CaptureBackend:
@@ -2948,6 +3218,9 @@ def cmd_comment(args: list[str]) -> int:
     click_post_image = False
     test_image_crop = False
     rounds = 30
+    submit_comment_keys_override: Optional[tuple[str, ...]] = None
+    open_comment_mode = (os.environ.get("EASYMONEY_OPEN_COMMENT_MODE") or "keys").strip().lower()
+    submit_mode = (os.environ.get("EASYMONEY_SUBMIT_MODE") or "click").strip().lower()
 
     i = 0
     while i < len(args):
@@ -2989,6 +3262,25 @@ def cmd_comment(args: list[str]) -> int:
         elif arg == "--rounds":
             value, i = parse_option_value(args, i, "--rounds")
             rounds = max(1, int(value))
+        elif arg == "--submit-keys":
+            value, i = parse_option_value(args, i, "--submit-keys")
+            submit_comment_keys_override = parse_key_sequence_text(value, "--submit-keys")
+            submit_mode = "keys"
+        elif arg == "--submit-enter":
+            submit_comment_keys_override = ("enter",)
+            submit_mode = "keys"
+        elif arg == "--submit-click":
+            submit_mode = "click"
+        elif arg == "--submit-mode":
+            submit_mode, i = parse_option_value(args, i, "--submit-mode")
+            submit_mode = submit_mode.strip().lower()
+        elif arg == "--open-click":
+            open_comment_mode = "click"
+        elif arg == "--open-keys":
+            open_comment_mode = "keys"
+        elif arg == "--open-mode":
+            open_comment_mode, i = parse_option_value(args, i, "--open-mode")
+            open_comment_mode = open_comment_mode.strip().lower()
         elif arg in {"--ocr-comment", "--fast", "--stream-capture", "--yolo-debug", "--save-yolo-images"}:
             print(f"提示: Windows v1 暂不完整支持 {arg}，已忽略或降级")
         i += 1
@@ -3153,57 +3445,159 @@ def cmd_comment(args: list[str]) -> int:
 
     if config is None:
         raise EasyMoneyError("未找到评论配置，请先运行 comment-locate")
-    send_point, send_method = resolve_send_point(post.action_point, window_rect, config)
+    open_comment_keys = parse_key_sequence_text(os.environ.get("EASYMONEY_OPEN_COMMENT_KEYS", "tab,enter"), "EASYMONEY_OPEN_COMMENT_KEYS")
+    submit_comment_keys = submit_comment_keys_override or parse_key_sequence_text(
+        os.environ.get("EASYMONEY_SUBMIT_KEYS", "tab,tab,tab,enter"),
+        "EASYMONEY_SUBMIT_KEYS",
+    )
+    if open_comment_mode in {"mouse", "coordinate"}:
+        open_comment_mode = "click"
+    if open_comment_mode not in {"keys", "keyboard", "click"}:
+        raise EasyMoneyError("--open-mode 只支持 keys 或 click")
+    if open_comment_mode == "keyboard":
+        open_comment_mode = "keys"
+    if submit_mode in {"mouse", "coordinate"}:
+        submit_mode = "click"
+    if submit_mode not in {"keys", "keyboard", "click"}:
+        raise EasyMoneyError("--submit-mode 只支持 keys 或 click")
+    if submit_mode == "keyboard":
+        submit_mode = "keys"
+    comment_point = Point(
+        post.action_point.x + config.comment_from_action.x,
+        post.action_point.y + config.comment_from_action.y,
+    )
+    comment_open_method = (
+        f"点击评论菜单[dx={int(config.comment_from_action.x)},dy={int(config.comment_from_action.y)}]"
+        if open_comment_mode == "click"
+        else format_key_sequence(open_comment_keys)
+    )
+    send_point, send_point_method = resolve_send_point(post.action_point, window_rect, config)
+    submit_method = f"点击发送按钮[{send_point_method}]" if submit_mode == "click" else format_key_sequence(submit_comment_keys)
     if debug:
         input_backend.move_to(post.action_point)
         print(f"DEBUG: 操作按钮点 ({int(post.action_point.x)}, {int(post.action_point.y)})")
-        print("DEBUG: 打开评论方式: Tab+Enter")
-        print("DEBUG: 发送方式: Tab+Tab+Tab+Enter")
-        print(f"DEBUG: 发送点参考 [{send_method}] ({int(send_point.x)}, {int(send_point.y)})")
+        print(f"DEBUG: 打开评论方式: {comment_open_method}")
+        print(f"DEBUG: 评论菜单点 ({int(comment_point.x)}, {int(comment_point.y)})")
+        print(f"DEBUG: 发送方式: {submit_method}")
+        print(f"DEBUG: 发送点参考 [{send_point_method}] ({int(send_point.x)}, {int(send_point.y)})")
         print(f"DEBUG: 评论内容: {final_text}")
         return 0
 
-    open_comment_keys = ("tab", "enter")
-    submit_comment_keys = ("tab", "tab", "tab", "enter")
-    input_backend.prepare_key_sequence(open_comment_keys)
-    input_backend.prepare_key_sequence(submit_comment_keys)
+    if open_comment_mode == "keys":
+        input_backend.prepare_key_sequence(open_comment_keys)
+    if submit_mode == "keys":
+        input_backend.prepare_key_sequence(submit_comment_keys)
+    fuse_open_keys = (
+        open_comment_mode == "keys"
+        and os.environ.get("EASYMONEY_FUSE_OPEN_KEYS", "0").strip().lower() in {"1", "true", "yes", "on"}
+        and hasattr(input_backend, "click_and_press_sequence_atomic")
+    )
+    fuse_text_submit = (
+        submit_mode == "keys"
+        and os.environ.get("EASYMONEY_FUSE_TEXT_SUBMIT", "1").strip().lower() not in {"0", "false", "no", "off"}
+    )
+    fuse_all_inputs = (
+        open_comment_mode == "keys"
+        and submit_mode == "keys"
+        and os.environ.get("EASYMONEY_FUSE_ALL_INPUTS", "1").strip().lower() in {"1", "true", "yes", "on"}
+        and hasattr(input_backend, "click_press_text_press_atomic")
+    )
 
     send_flow_start = time.perf_counter()
-    step_start = time.perf_counter()
-    input_backend.click(post.action_point, interval=0.0)
-    action_click_ms = int((time.perf_counter() - step_start) * 1000)
+    if fuse_all_inputs:
+        step_start = time.perf_counter()
+        can_type_text_directly = getattr(input_backend, "can_type_text_directly", input_backend.can_type_directly)
+        if can_type_text_directly(final_text):
+            try:
+                text_input_method = input_backend.click_press_text_press_atomic(
+                    post.action_point,
+                    open_comment_keys,
+                    final_text,
+                    submit_comment_keys,
+                )
+                total_send_ms = int((time.perf_counter() - send_flow_start) * 1000)
+                combined_all_ms = int((time.perf_counter() - step_start) * 1000)
+                print(
+                    f"已执行评论发送: {text_input_method} | 打开评论={comment_open_method} | "
+                    f"发送方式={submit_method} | 发送点参考=({int(send_point.x)}, {int(send_point.y)})"
+                )
+                print(
+                    f"发送流程耗时: 总计={total_send_ms}ms | "
+                    f"点操作+打开评论+输入+发送快捷键={combined_all_ms}ms"
+                )
+                return 0
+            except EasyMoneyError:
+                pass
 
     step_start = time.perf_counter()
-    input_backend.press_sequence_atomic(open_comment_keys)
-    comment_open_method = "Tab+Enter"
-    open_comment_ms = int((time.perf_counter() - step_start) * 1000)
-
-    step_start = time.perf_counter()
-    if input_backend.can_type_directly(final_text):
-        paste_method = input_backend.type_text_directly(final_text)
+    if fuse_open_keys:
+        input_backend.click_and_press_sequence_atomic(post.action_point, open_comment_keys)
+        action_click_ms = int((time.perf_counter() - step_start) * 1000)
+        open_comment_ms = 0
     else:
-        paste_method = input_backend.paste_text(
-            final_text,
-            restore_clipboard=False,
-            before_paste_delay=0.0,
-            after_paste_delay=0.012,
-        )
-    paste_ms = int((time.perf_counter() - step_start) * 1000)
+        input_backend.click(post.action_point, interval=0.0)
+        action_click_ms = int((time.perf_counter() - step_start) * 1000)
 
-    step_start = time.perf_counter()
-    input_backend.press_sequence_atomic(submit_comment_keys)
-    send_method = "Tab+Tab+Tab+Enter"
-    send_shortcut_ms = int((time.perf_counter() - step_start) * 1000)
+        step_start = time.perf_counter()
+        if open_comment_mode == "click":
+            open_click_delay_ms = float(os.environ.get("EASYMONEY_OPEN_CLICK_DELAY_MS", "0"))
+            if open_click_delay_ms > 0:
+                precise_delay(open_click_delay_ms / 1000.0)
+            input_backend.click(comment_point, interval=0.0)
+        else:
+            input_backend.press_sequence_atomic(open_comment_keys)
+        open_comment_ms = int((time.perf_counter() - step_start) * 1000)
+
+    combined_text_submit_ms: Optional[int] = None
+    text_input_method = ""
+    send_step_label = "发送点击" if submit_mode == "click" else "发送快捷键"
+    can_type_text_directly = getattr(input_backend, "can_type_text_directly", input_backend.can_type_directly)
+    if fuse_text_submit and can_type_text_directly(final_text) and hasattr(input_backend, "type_text_and_press_keys_directly"):
+        step_start = time.perf_counter()
+        try:
+            text_input_method = input_backend.type_text_and_press_keys_directly(final_text, submit_comment_keys)
+            combined_text_submit_ms = int((time.perf_counter() - step_start) * 1000)
+            text_input_ms = 0
+            send_submit_ms = 0
+        except EasyMoneyError:
+            combined_text_submit_ms = None
+
+    if combined_text_submit_ms is None:
+        step_start = time.perf_counter()
+        if can_type_text_directly(final_text):
+            text_input_method = input_backend.type_text_directly(final_text)
+        else:
+            text_input_method = input_backend.paste_text(
+                final_text,
+                restore_clipboard=False,
+                before_paste_delay=0.0,
+                after_paste_delay=0.012,
+            )
+        text_input_ms = int((time.perf_counter() - step_start) * 1000)
+
+        step_start = time.perf_counter()
+        if submit_mode == "click":
+            input_backend.click(send_point, interval=0.0)
+        else:
+            input_backend.press_sequence_atomic(submit_comment_keys)
+        send_submit_ms = int((time.perf_counter() - step_start) * 1000)
     total_send_ms = int((time.perf_counter() - send_flow_start) * 1000)
     print(
-        f"已执行评论发送: {paste_method} | 打开评论={comment_open_method} | "
-        f"发送方式={send_method} | 发送点参考=({int(send_point.x)}, {int(send_point.y)})"
+        f"已执行评论发送: {text_input_method} | 打开评论={comment_open_method} | "
+        f"发送方式={submit_method} | 发送点参考=({int(send_point.x)}, {int(send_point.y)})"
     )
-    print(
-        f"发送流程耗时: 总计={total_send_ms}ms | "
-        f"点操作={action_click_ms}ms | 打开评论={open_comment_ms}ms | "
-        f"粘贴={paste_ms}ms | 发送快捷键={send_shortcut_ms}ms"
-    )
+    if combined_text_submit_ms is not None:
+        print(
+            f"发送流程耗时: 总计={total_send_ms}ms | "
+            f"点操作={action_click_ms}ms | 打开评论={open_comment_ms}ms | "
+            f"输入+{send_step_label}={combined_text_submit_ms}ms"
+        )
+    else:
+        print(
+            f"发送流程耗时: 总计={total_send_ms}ms | "
+            f"点操作={action_click_ms}ms | 打开评论={open_comment_ms}ms | "
+            f"输入={text_input_ms}ms | {send_step_label}={send_submit_ms}ms"
+        )
     return 0
 
 

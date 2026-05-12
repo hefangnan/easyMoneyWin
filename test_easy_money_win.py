@@ -89,6 +89,39 @@ class EasyMoneyWinTests(unittest.TestCase):
             finally:
                 em.CONFIG_KB = old_db
 
+    def test_window_backend_uses_pywinauto_desktop(self):
+        old_require_module = em.require_module
+        calls: list[tuple[str, object]] = []
+
+        class FakePywinauto:
+            @staticmethod
+            def Desktop(backend: str) -> object:
+                calls.append(("Desktop", backend))
+                return object()
+
+        class FakeTimingsModule:
+            class Timings:
+                window_find_timeout = 5.0
+
+        def fake_require_module(module_name: str, pip_name: str | None = None) -> object:
+            calls.append((module_name, pip_name))
+            if module_name == "pywinauto":
+                return FakePywinauto
+            if module_name == "pywinauto.timings":
+                return FakeTimingsModule
+            raise AssertionError(f"unexpected module: {module_name}")
+
+        try:
+            em.require_module = fake_require_module
+            backend = em.WindowBackend()
+
+            self.assertIsNotNone(backend.desktop)
+            self.assertIn(("pywinauto", None), calls)
+            self.assertIn(("Desktop", "uia"), calls)
+            self.assertNotIn(("uiautomation", None), calls)
+        finally:
+            em.require_module = old_require_module
+
     def test_comment_aborts_when_window_rect_unavailable_before_refresh(self):
         old_window_backend = em.WindowBackend
         old_input_backend = em.InputBackend

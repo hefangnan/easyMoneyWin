@@ -769,18 +769,25 @@ def uia_control_type_name(control_type: Any) -> str:
 
 class WindowBackend:
     def __init__(self) -> None:
-        self.auto = require_module("uiautomation")
+        self.pywinauto = require_module("pywinauto")
         try:
-            self.auto.SetGlobalSearchTimeout(float(os.environ.get("EASYMONEY_UIA_SEARCH_TIMEOUT", "1")))
+            timings = require_module("pywinauto.timings", "pywinauto")
+            timings.Timings.window_find_timeout = float(os.environ.get("EASYMONEY_UIA_SEARCH_TIMEOUT", "1"))
         except Exception:
             pass
-        self.root = self.auto.GetRootControl()
+        self.desktop = self.pywinauto.Desktop(backend="uia")
         self._comtypes_client: Optional[Any] = None
         self._uia_module: Optional[Any] = None
         self._automation: Optional[Any] = None
 
     @staticmethod
     def _safe_text(control: Any) -> str:
+        try:
+            text = control.window_text()
+            if text:
+                return str(text)
+        except Exception:
+            pass
         for attr in ("Name", "CurrentName"):
             try:
                 value = getattr(control, attr)
@@ -794,6 +801,12 @@ class WindowBackend:
 
     @staticmethod
     def _control_type(control: Any) -> str:
+        try:
+            control_type = control.element_info.control_type
+            if control_type:
+                return str(control_type)
+        except Exception:
+            pass
         for attr in ("ControlTypeName", "CurrentControlType", "CurrentLocalizedControlType"):
             try:
                 value = getattr(control, attr)
@@ -814,6 +827,12 @@ class WindowBackend:
 
     @staticmethod
     def _automation_id(control: Any) -> str:
+        try:
+            automation_id = control.element_info.automation_id
+            if automation_id:
+                return str(automation_id)
+        except Exception:
+            pass
         for attr in ("AutomationId", "CurrentAutomationId"):
             try:
                 value = getattr(control, attr)
@@ -827,6 +846,12 @@ class WindowBackend:
 
     @staticmethod
     def _class_name(control: Any) -> str:
+        try:
+            class_name = control.element_info.class_name
+            if class_name:
+                return str(class_name)
+        except Exception:
+            pass
         for attr in ("ClassName", "CurrentClassName"):
             try:
                 value = getattr(control, attr)
@@ -860,7 +885,11 @@ class WindowBackend:
 
     def windows(self) -> list[Any]:
         try:
-            return list(self.root.GetChildren())
+            return list(self.desktop.windows())
+        except Exception:
+            pass
+        try:
+            return list(self.desktop.children())
         except Exception as exc:
             raise EasyMoneyError(f"读取窗口列表失败: {exc}") from exc
 
@@ -875,6 +904,12 @@ class WindowBackend:
         return self._automation, self._uia_module
 
     def _com_element(self, control: Any) -> Any:
+        try:
+            element = control.element_info.element
+            if element:
+                return element
+        except Exception:
+            pass
         for attr in ("NativeWindowHandle", "CurrentNativeWindowHandle"):
             try:
                 handle = getattr(control, attr)
@@ -933,6 +968,15 @@ class WindowBackend:
 
     def activate(self, control: Any) -> None:
         try:
+            control.restore()
+        except Exception:
+            pass
+        try:
+            control.set_focus()
+            return
+        except Exception:
+            pass
+        try:
             control.SetActive()
             return
         except Exception:
@@ -952,11 +996,11 @@ class WindowBackend:
 
     def children(self, control: Any) -> list[Any]:
         try:
-            return list(control.GetChildren())
+            return list(control.children())
         except Exception:
             pass
         try:
-            return list(control.children())
+            return list(control.GetChildren())
         except Exception:
             pass
         try:
@@ -972,6 +1016,13 @@ class WindowBackend:
 
     @staticmethod
     def _control_identity(control: Any) -> Any:
+        try:
+            runtime_id = control.element_info.element.GetRuntimeId()
+            values = tuple(int(item) for item in runtime_id)
+            if values:
+                return ("runtime", values)
+        except Exception:
+            pass
         try:
             runtime_id = control.GetRuntimeId()
             values = tuple(int(item) for item in runtime_id)
@@ -1004,7 +1055,7 @@ class WindowBackend:
                 stack.append((child, depth + 1))
 
     def iter_tree_view(self, control: Any, max_depth: int = 10, view: str = "control") -> Iterable[tuple[Any, int]]:
-        if view in {"", "default", "uiautomation"}:
+        if view in {"", "default", "pywinauto"}:
             yield from self.iter_tree(control, max_depth=max_depth)
             return
         walker = self._walker_for_view(view)

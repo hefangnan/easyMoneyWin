@@ -27,7 +27,7 @@ from typing import Any, Callable, Iterable, Optional
 APP_NAME = "easyMoney Windows"
 APP_VERSION = "0.1.0"
 SCHEMA_VERSION = 24
-COMMENT_REFRESH_WAIT_SECONDS = 0.2
+COMMENT_REFRESH_WAIT_SECONDS = 0.1
 COMMENT_REFRESH_CAPTURE_INTERVAL_SECONDS = 0.012
 COMMENT_REFRESH_IDLE_SECONDS = 0.003
 
@@ -1206,6 +1206,12 @@ def precise_delay(seconds: float) -> None:
     deadline = time.perf_counter() + seconds
     while time.perf_counter() < deadline:
         pass
+
+
+def current_timestamp_ms() -> str:
+    now = time.time()
+    millis = int((now % 1) * 1000)
+    return f"{time.strftime('%H:%M:%S', time.localtime(now))}.{millis:03d}"
 
 
 BLOCKED_TEXT_SNIPPETS = {
@@ -3016,8 +3022,7 @@ def cmd_comment(args: list[str]) -> int:
     refresh_capture: Optional[CaptureBackend] = None
     for round_index in range(1, rounds + 1):
         try:
-            if rounds > 1:
-                print(f"UIA用户匹配: 第 {round_index}/{rounds} 轮")
+            print(f"[{current_timestamp_ms()}] UIA用户匹配: 第 {round_index}/{rounds} 轮")
             win = backend.moments_window()
             current_window_rect = backend.rect(win)
             if current_window_rect is None:

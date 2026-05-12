@@ -779,6 +779,7 @@ class WindowBackend:
         self._comtypes_client: Optional[Any] = None
         self._uia_module: Optional[Any] = None
         self._automation: Optional[Any] = None
+        self._sns_list_cache: dict[Any, Any] = {}
 
     @staticmethod
     def _safe_text(control: Any) -> str:
@@ -937,6 +938,43 @@ class WindowBackend:
             return automation.ContentViewWalker
         return automation.ControlViewWalker
 
+    def find_sns_list_fast(self, root: Any) -> Optional[Any]:
+        cache_key = self._control_identity(root)
+        cached = self._sns_list_cache.get(cache_key)
+        if cached is not None and is_sns_list_control(self, cached):
+            return cached
+
+        try:
+            automation, UIA = self._ensure_automation()
+            root_element = self._com_element(root)
+            automation_id_condition = automation.CreatePropertyCondition(
+                UIA.UIA_AutomationIdPropertyId,
+                "sns_list",
+            )
+            control_type_condition = automation.CreatePropertyCondition(
+                UIA.UIA_ControlTypePropertyId,
+                UIA.UIA_ListControlTypeId,
+            )
+            condition = automation.CreateAndCondition(automation_id_condition, control_type_condition)
+            element = root_element.FindFirst(UIA.TreeScope_Subtree, condition)
+            if element is not None and is_sns_list_control(self, element):
+                self._sns_list_cache[cache_key] = element
+                return element
+        except Exception:
+            pass
+
+        try:
+            child_window = getattr(root, "child_window", None)
+            if callable(child_window):
+                spec = child_window(auto_id="sns_list", control_type="List")
+                wrapper = spec.wrapper_object()
+                if is_sns_list_control(self, wrapper):
+                    self._sns_list_cache[cache_key] = wrapper
+                    return wrapper
+        except Exception:
+            pass
+        return None
+
     def moments_window(self) -> Any:
         candidates = []
         fallback_candidates = []
@@ -1013,6 +1051,15 @@ class WindowBackend:
             return children
         except Exception:
             return []
+
+    def listitem_children(self, control: Any, limit: Optional[int] = None) -> list[Any]:
+        try:
+            children = list(control.children(control_type="ListItem"))
+            if children:
+                return children[:limit] if limit is not None else children
+        except Exception:
+            pass
+        return []
 
     @staticmethod
     def _control_identity(control: Any) -> Any:
@@ -1215,13 +1262,19 @@ def is_sns_list_control(window_backend: WindowBackend, node: Any) -> bool:
 
 
 def find_sns_list_control(window_backend: WindowBackend, root: Any, max_depth: int = 8) -> Optional[Any]:
+    fast = window_backend.find_sns_list_fast(root)
+    if fast is not None:
+        return fast
+
     for node, _ in window_backend.iter_tree(root, max_depth=max_depth):
         if is_sns_list_control(window_backend, node):
+            window_backend._sns_list_cache[window_backend._control_identity(root)] = node
             return node
 
     try:
         for node, _ in window_backend.iter_tree_view(root, max_depth=max_depth, view="raw"):
             if is_sns_list_control(window_backend, node):
+                window_backend._sns_list_cache[window_backend._control_identity(root)] = node
                 return node
     except Exception:
         pass
@@ -1232,6 +1285,7 @@ def find_sns_list_control(window_backend: WindowBackend, root: Any, max_depth: i
             spec = child_window(auto_id="sns_list", control_type="List")
             wrapper = spec.wrapper_object()
             if is_sns_list_control(window_backend, wrapper):
+                window_backend._sns_list_cache[window_backend._control_identity(root)] = wrapper
                 return wrapper
     except Exception:
         pass
@@ -1242,6 +1296,7 @@ def find_sns_list_control(window_backend: WindowBackend, root: Any, max_depth: i
         descendants = []
     for node in descendants:
         if is_sns_list_control(window_backend, node):
+            window_backend._sns_list_cache[window_backend._control_identity(root)] = node
             return node
     return None
 
@@ -1283,30 +1338,34 @@ def dump_named_list_contents(
     item_index: int = 2,
 ) -> tuple[bool, bool, int]:
     expected = name.strip()
-    for node, _ in window_backend.iter_tree_view(root, max_depth=max_depth, view=view):
-        if window_backend._control_type(node).lower() != "list":
+    if expected == "朋友圈":
+        node = find_sns_list_control(window_backend, root, max_depth=max_depth)
+    else:
+        node = find_named_list_control(window_backend, root, expected, max_depth=max_depth, view=view)
+    if node is None:
+        return False, False, 0
+    if window_backend._control_type(node).lower() != "list":
+        return False, False, 0
+    if expected and window_backend._safe_text(node).strip() != expected:
+        return False, False, 0
+
+    if not quiet:
+        print_uia_node(window_backend, node, depth=0)
+    found_list_item = False
+    seen_list_items = 0
+    item_count = 0
+    read_limit = None if item_limit <= 0 else item_index + item_limit - 1
+    for child in find_list_items_under_control(window_backend, node, limit=read_limit):
+        seen_list_items += 1
+        if seen_list_items < item_index:
             continue
-        if window_backend._safe_text(node).strip() != expected:
-            continue
+        item_count += 1
+        found_list_item = True
         if not quiet:
-            print_uia_node(window_backend, node, depth=0)
-        found_list_item = False
-        seen_list_items = 0
-        item_count = 0
-        for child in window_backend.children(node):
-            if window_backend._control_type(child).lower() != "listitem":
-                continue
-            seen_list_items += 1
-            if seen_list_items < item_index:
-                continue
-            item_count += 1
-            found_list_item = True
-            if not quiet:
-                print_uia_node(window_backend, child, depth=1)
-            if item_limit > 0 and item_count >= item_limit:
-                break
-        return True, found_list_item, item_count
-    return False, False, 0
+            print_uia_node(window_backend, child, depth=1)
+        if item_limit > 0 and item_count >= item_limit:
+            break
+    return True, found_list_item, item_count
 
 
 def find_list_items_under_control(window_backend: WindowBackend, root: Any, max_depth: int = 3, limit: Optional[int] = None) -> list[Any]:
@@ -1322,6 +1381,13 @@ def find_list_items_under_control(window_backend: WindowBackend, root: Any, max_
         seen.add(marker)
         items.append(node)
         return limit is not None and len(items) >= limit
+
+    for node in window_backend.listitem_children(root, limit=limit):
+        if add_if_list_item(node):
+            return items
+
+    if items and (limit is None or len(items) >= limit):
+        return items
 
     for node in window_backend.children(root):
         if add_if_list_item(node):

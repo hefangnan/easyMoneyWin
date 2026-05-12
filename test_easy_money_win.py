@@ -122,6 +122,97 @@ class EasyMoneyWinTests(unittest.TestCase):
         finally:
             em.require_module = old_require_module
 
+    def test_sns_list_lookup_prefers_fast_path(self):
+        sentinel = object()
+
+        class FakeBackend:
+            def __init__(self) -> None:
+                self.iter_calls = 0
+
+            def find_sns_list_fast(self, root: object) -> object:
+                return sentinel
+
+            def iter_tree(self, root: object, max_depth: int = 8):
+                self.iter_calls += 1
+                return iter(())
+
+        backend = FakeBackend()
+        self.assertIs(em.find_sns_list_control(backend, object()), sentinel)
+        self.assertEqual(backend.iter_calls, 0)
+
+    def test_list_item_lookup_prefers_direct_children(self):
+        class FakeNode:
+            def __init__(self, kind: str) -> None:
+                self.kind = kind
+
+        class FakeBackend:
+            def listitem_children(self, root: object, limit=None):
+                return [FakeNode("listitem"), FakeNode("listitem")]
+
+            def children(self, root: object):
+                raise AssertionError("children traversal should not run when direct list items are available")
+
+            def _control_identity(self, node: FakeNode):
+                return id(node)
+
+            def _control_type(self, node: FakeNode):
+                return node.kind
+
+        items = em.find_list_items_under_control(FakeBackend(), object(), limit=1)
+        self.assertEqual(len(items), 1)
+
+    def test_default_dump_uses_sns_list_fast_path(self):
+        class FakeNode:
+            def __init__(self, kind: str, name: str = "", automation_id: str = "") -> None:
+                self.kind = kind
+                self.name = name
+                self.automation_id = automation_id
+
+        sns_list = FakeNode("list", "朋友圈", "sns_list")
+
+        class FakeBackend:
+            def __init__(self) -> None:
+                self.item_limit = None
+
+            def find_sns_list_fast(self, root: object) -> FakeNode:
+                return sns_list
+
+            def iter_tree(self, root: object, max_depth: int = 8):
+                raise AssertionError("raw tree traversal should not run for default sns_list dump")
+
+            def _control_type(self, node: FakeNode) -> str:
+                return node.kind
+
+            def _safe_text(self, node: FakeNode) -> str:
+                return node.name
+
+            def _automation_id(self, node: FakeNode) -> str:
+                return node.automation_id
+
+            def rect(self, node: FakeNode):
+                return em.Rect(0, 0, 100, 20)
+
+            def listitem_children(self, root: FakeNode, limit=None):
+                self.item_limit = limit
+                return [FakeNode("listitem", "ignored"), FakeNode("listitem", "fn post")]
+
+            def _control_identity(self, node: FakeNode):
+                return id(node)
+
+        backend = FakeBackend()
+        found_sns, found_item, item_count = em.dump_named_list_contents(
+            backend,
+            object(),
+            "朋友圈",
+            quiet=True,
+            item_index=2,
+            item_limit=1,
+        )
+        self.assertTrue(found_sns)
+        self.assertTrue(found_item)
+        self.assertEqual(item_count, 1)
+        self.assertEqual(backend.item_limit, 2)
+
     def test_comment_aborts_when_window_rect_unavailable_before_refresh(self):
         old_window_backend = em.WindowBackend
         old_input_backend = em.InputBackend

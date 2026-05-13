@@ -88,12 +88,6 @@ python .\easy_money_win.py comment --text "好看！" --user 方南
 python .\easy_money_win.py comment --text "好看！" --user 方南
 ```
 
-如需实验坐标点击打开评论菜单，可以显式指定：
-
-```powershell
-python .\easy_money_win.py comment --text "好看！" --user 方南 --open-click
-```
-
 如需显式指定坐标点击发送，可以使用：
 
 ```powershell

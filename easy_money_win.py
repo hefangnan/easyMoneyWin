@@ -3089,7 +3089,6 @@ def cmd_comment(args: list[str]) -> int:
     preferred_store: Optional[str] = None
     debug = False
     save_post_image = False
-    save_post_image_raw = False
     save_path: Optional[Path] = None
     click_post_image = False
     test_image_crop = False
@@ -3126,8 +3125,6 @@ def cmd_comment(args: list[str]) -> int:
             debug = True
         elif arg == "--save-post-image":
             save_post_image = True
-        elif arg == "--raw":
-            save_post_image_raw = True
         elif arg == "--output":
             value, i = parse_option_value(args, i, "--output")
             save_path = expand_path(value)

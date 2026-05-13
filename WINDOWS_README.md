@@ -1,6 +1,6 @@
 # easyMoney Windows Python 版
 
-`easy_money_win.py` 是 `easyMoney.swift` 的 Windows 第一版迁移。它优先保留常用工作流：微信朋友圈窗口定位、按 `locate` 保存的刷新按钮坐标自动刷新、通过 UI Automation 读取朋友圈 `sns_list` 的第二条 `ListItem` 来匹配目标动态、自动评论、LLM/豆包答题、SQLite 知识库查询。
+`easy_money_win.py` 是 `easyMoney.swift` 的 Windows 第一版迁移入口。具体实现按功能拆在 `easy_money_win_core.py`、`easy_money_win_input.py`、`easy_money_win_capture.py`、`easy_money_win_uia.py`、`easy_money_win_llm.py`、`easy_money_win_commands.py`。它优先保留常用工作流：微信朋友圈窗口定位、按 `locate` 保存的刷新按钮坐标自动刷新、通过 UI Automation 读取朋友圈 `sns_list` 的第二条 `ListItem` 来匹配目标动态、自动评论、LLM/豆包答题、SQLite 知识库查询。
 
 这不是 Swift 版的逐行复刻。macOS 的 `AXUIElement`、`CGEvent`、`ScreenCaptureKit`、`Vision`、`CoreML` 在 Windows 上分别替换为 UI Automation、Win32 输入、DXGI Desktop Duplication（`dxcam`，`mss` 兜底）、可选 OpenCV/YOLO。第一版不默认启用 OCR，也不迁移 CoreML。
 

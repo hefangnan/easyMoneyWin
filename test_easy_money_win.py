@@ -6,14 +6,18 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 import easy_money_win as em
+import easy_money_win_commands as em_commands
+import easy_money_win_core as em_core
+import easy_money_win_llm as em_llm
+import easy_money_win_uia as em_uia
 
 
 class EasyMoneyWinTests(unittest.TestCase):
     def test_point_and_comment_config_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
-            old_path = em.CONFIG_COMMENT
+            old_path = em_core.CONFIG_COMMENT
             try:
-                em.CONFIG_COMMENT = Path(tmp) / ".wechat_comment_config"
+                em_core.CONFIG_COMMENT = Path(tmp) / ".wechat_comment_config"
                 config = em.CommentConfig(
                     comment_from_action=em.Point(10, 20),
                     send_x_ratio=0.82,
@@ -28,24 +32,24 @@ class EasyMoneyWinTests(unittest.TestCase):
                 self.assertEqual(loaded.send_from_action, em.Point(30, 40))
                 self.assertEqual(loaded.fixed_send_window_offset, em.Point(700, 650))
             finally:
-                em.CONFIG_COMMENT = old_path
+                em_core.CONFIG_COMMENT = old_path
 
     def test_dotenv_loading(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_cwd = os.getcwd()
-            old_cache = em._DOTENV_CACHE
+            old_cache = em_llm._DOTENV_CACHE
             try:
                 os.chdir(tmp)
                 Path(".easyMoney.env").write_text(
                     "export EASYMONEY_LLM_PROVIDER=doubao\nARK_MODEL='demo-model'\n",
                     encoding="utf-8",
                 )
-                em._DOTENV_CACHE = None
+                em_llm._DOTENV_CACHE = None
                 self.assertEqual(em.first_non_empty_env(["EASYMONEY_LLM_PROVIDER"]), "doubao")
                 self.assertEqual(em.first_non_empty_env(["ARK_MODEL"]), "demo-model")
             finally:
                 os.chdir(old_cwd)
-                em._DOTENV_CACHE = old_cache
+                em_llm._DOTENV_CACHE = old_cache
 
     def test_llm_response_parsers(self):
         self.assertEqual(
@@ -62,7 +66,7 @@ class EasyMoneyWinTests(unittest.TestCase):
         )
 
     def test_window_backend_uses_pywinauto_desktop(self):
-        old_require_module = em.require_module
+        old_require_module = em_uia.require_module
         calls: list[tuple[str, object]] = []
 
         class FakePywinauto:
@@ -84,7 +88,7 @@ class EasyMoneyWinTests(unittest.TestCase):
             raise AssertionError(f"unexpected module: {module_name}")
 
         try:
-            em.require_module = fake_require_module
+            em_uia.require_module = fake_require_module
             backend = em.WindowBackend()
 
             self.assertIsNotNone(backend.desktop)
@@ -92,7 +96,7 @@ class EasyMoneyWinTests(unittest.TestCase):
             self.assertIn(("Desktop", "uia"), calls)
             self.assertNotIn(("uiautomation", None), calls)
         finally:
-            em.require_module = old_require_module
+            em_uia.require_module = old_require_module
 
     def test_sns_list_lookup_prefers_fast_path(self):
         sentinel = object()
@@ -186,9 +190,9 @@ class EasyMoneyWinTests(unittest.TestCase):
         self.assertEqual(backend.item_limit, 2)
 
     def test_comment_aborts_when_window_rect_unavailable_before_refresh(self):
-        old_window_backend = em.WindowBackend
-        old_input_backend = em.InputBackend
-        old_refresh_point = em.refresh_point_from_saved_offset
+        old_window_backend = em_commands.WindowBackend
+        old_input_backend = em_commands.InputBackend
+        old_refresh_point = em_commands.refresh_point_from_saved_offset
         clicks: list[em.Point] = []
 
         class FakeWindowBackend:
@@ -212,9 +216,9 @@ class EasyMoneyWinTests(unittest.TestCase):
                 clicks.append(point)
 
         try:
-            em.WindowBackend = FakeWindowBackend
-            em.InputBackend = FakeInputBackend
-            em.refresh_point_from_saved_offset = lambda backend: em.Point(184, 186)
+            em_commands.WindowBackend = FakeWindowBackend
+            em_commands.InputBackend = FakeInputBackend
+            em_commands.refresh_point_from_saved_offset = lambda backend: em.Point(184, 186)
 
             with redirect_stdout(io.StringIO()):
                 with self.assertRaises(em.WindowPositionUnavailable):
@@ -222,9 +226,9 @@ class EasyMoneyWinTests(unittest.TestCase):
 
             self.assertEqual(clicks, [])
         finally:
-            em.WindowBackend = old_window_backend
-            em.InputBackend = old_input_backend
-            em.refresh_point_from_saved_offset = old_refresh_point
+            em_commands.WindowBackend = old_window_backend
+            em_commands.InputBackend = old_input_backend
+            em_commands.refresh_point_from_saved_offset = old_refresh_point
 
     def test_parse_comment_options_collects_comment_modes(self):
         options = em.parse_comment_options([
@@ -265,11 +269,11 @@ class EasyMoneyWinTests(unittest.TestCase):
 
     def test_comment_sends_with_default_click_after_typing(self):
         with tempfile.TemporaryDirectory() as tmp:
-            old_comment_config = em.CONFIG_COMMENT
-            old_window_backend = em.WindowBackend
-            old_input_backend = em.InputBackend
-            old_refresh_point = em.refresh_point_from_saved_offset
-            old_resolve_second = em.resolve_second_uia_list_item_post
+            old_comment_config = em_core.CONFIG_COMMENT
+            old_window_backend = em_commands.WindowBackend
+            old_input_backend = em_commands.InputBackend
+            old_refresh_point = em_commands.refresh_point_from_saved_offset
+            old_resolve_second = em_commands.resolve_second_uia_list_item_post
             old_submit_mode = os.environ.pop("EASYMONEY_SUBMIT_MODE", None)
             events: list[tuple[str, object]] = []
             window_backends: list[object] = []
@@ -311,7 +315,7 @@ class EasyMoneyWinTests(unittest.TestCase):
 
             try:
                 root = Path(tmp)
-                em.CONFIG_COMMENT = root / ".wechat_comment_config"
+                em_core.CONFIG_COMMENT = root / ".wechat_comment_config"
                 em.save_comment_config(
                     em.CommentConfig(
                         comment_from_action=em.Point(-66, -3),
@@ -319,10 +323,10 @@ class EasyMoneyWinTests(unittest.TestCase):
                         send_from_action=em.Point(-33, 99),
                     )
                 )
-                em.WindowBackend = FakeWindowBackend
-                em.InputBackend = FakeInputBackend
-                em.refresh_point_from_saved_offset = lambda backend: em.Point(153, 43)
-                em.resolve_second_uia_list_item_post = lambda *args, **kwargs: em.UIAListItemResolution(
+                em_commands.WindowBackend = FakeWindowBackend
+                em_commands.InputBackend = FakeInputBackend
+                em_commands.refresh_point_from_saved_offset = lambda backend: em.Point(153, 43)
+                em_commands.resolve_second_uia_list_item_post = lambda *args, **kwargs: em.UIAListItemResolution(
                     item_index=1,
                     body_frame=em.Rect(80, 100, 340, 170),
                     action_point=em.Point(300, 160),
@@ -349,11 +353,11 @@ class EasyMoneyWinTests(unittest.TestCase):
                 ])
                 self.assertEqual(window_backends[0].moments_window_calls, 1)
             finally:
-                em.CONFIG_COMMENT = old_comment_config
-                em.WindowBackend = old_window_backend
-                em.InputBackend = old_input_backend
-                em.refresh_point_from_saved_offset = old_refresh_point
-                em.resolve_second_uia_list_item_post = old_resolve_second
+                em_core.CONFIG_COMMENT = old_comment_config
+                em_commands.WindowBackend = old_window_backend
+                em_commands.InputBackend = old_input_backend
+                em_commands.refresh_point_from_saved_offset = old_refresh_point
+                em_commands.resolve_second_uia_list_item_post = old_resolve_second
                 if old_submit_mode is None:
                     os.environ.pop("EASYMONEY_SUBMIT_MODE", None)
                 else:

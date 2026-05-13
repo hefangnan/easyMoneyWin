@@ -20,8 +20,9 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        print("\n已停止")
+        print()
+        print_ts("已停止")
         raise SystemExit(130)
     except EasyMoneyError as exc:
-        print(f"错误: {exc}")
+        print_ts(f"错误: {exc}")
         raise SystemExit(1)

@@ -21,7 +21,7 @@ def print_usage() -> None:
   python easy_money_win.py comment-fixed-send-locate
   python easy_money_win.py post-image-locate
   python easy_money_win.py post-image-x-locate
-  python easy_money_win.py comment [--text 文本] [--solve-question|--doubao|--LLM [--vision]] --user <用户名前缀> [--debug] [--timing-detail]
+  python easy_money_win.py comment [--text 文本] [--solve-question|--doubao|--LLM [--vision] [--save-vision-image] [--vision-output 路径]] --user <用户名前缀> [--debug] [--timing-detail]
   python easy_money_win.py llm ask "<问题>" [上下文]
   python easy_money_win.py doubao ask "<朋友圈正文>"
 """
@@ -399,6 +399,12 @@ def parse_comment_options(args: list[str]) -> CommentOptions:
             options.solve_question = True
         elif arg == "--vision":
             options.use_vision = True
+        elif arg == "--save-vision-image":
+            options.save_vision_image = True
+        elif arg == "--vision-output":
+            value, i = parse_option_value(args, i, "--vision-output")
+            options.save_vision_image = True
+            options.vision_save_path = expand_path(value)
         elif arg == "--debug":
             options.debug = True
         elif arg == "--save-post-image":
@@ -420,7 +426,7 @@ def parse_comment_options(args: list[str]) -> CommentOptions:
             options.submit_mode = options.submit_mode.strip().lower()
         elif arg in {"--timing-detail", "--input-timing", "--trace-input"}:
             options.timing_detail = True
-        elif arg in {"--ocr-comment", "--stream-capture", "--yolo-debug", "--save-yolo-images"}:
+        elif arg in {"--ocr-comment", "--stream-capture"}:
             print(f"提示: Windows v1 暂不完整支持 {arg}，已忽略或降级")
         else:
             raise EasyMoneyError(f"未知 comment 参数: {arg}")
@@ -430,6 +436,8 @@ def parse_comment_options(args: list[str]) -> CommentOptions:
         raise EasyMoneyError("comment 命令必须显式指定 --user <用户名前缀>")
     if options.use_vision and not options.use_llm:
         raise EasyMoneyError("--vision 需要与 --LLM 一起使用")
+    if options.save_vision_image and not options.use_vision:
+        raise EasyMoneyError("--save-vision-image 需要与 --LLM --vision 一起使用")
     if not any([options.comment_text, options.solve_question, options.save_post_image, options.click_post_image, options.test_image_crop]):
         raise EasyMoneyError('请指定 --text "评论内容"，或使用 --solve-question / --doubao / --LLM / --save-post-image')
 
@@ -490,6 +498,7 @@ def resolve_comment_target_post(
                         f"UIA:ListItem #{list_item.item_index + 1} "
                         f"prefix={list_item.detected_prefix or '(空)'} total={list_item.elapsed_ms}ms"
                     ),
+                    inline_image_count=list_item.inline_image_count,
                 )
                 print(
                     "  UIA用户匹配成功: "
@@ -593,15 +602,20 @@ def resolve_comment_text(options: CommentOptions, post: MomentPostResolution, wi
         raise EasyMoneyError("需要自动答题但未能读取朋友圈正文")
     image_urls: list[str] = []
     if options.use_vision:
-        image_urls = capture_yolo_image_data_urls(post, window_rect)
-        print(f"已附带 YOLO 图片: {len(image_urls)} 张")
+        vision_save_path = None
+        if options.save_vision_image:
+            vision_save_path = options.vision_save_path or DEBUG_DIR / f"wechat_vision_image_{time.strftime('%Y%m%d_%H%M%S')}.png"
+        image_urls = capture_vision_image_data_urls(post, window_rect, save_path=vision_save_path)
+        print_ts(f"已附带视觉截图: {len(image_urls)} 张")
+        if vision_save_path is not None:
+            print_ts(f"视觉截图已保存: {vision_save_path}")
     solved = ask_doubao_to_solve_post(context, image_data_urls=image_urls)
     if solved:
         final_text = solved.answer
-        print(f"LLM 命中: {solved.answer}")
+        print_ts(f"LLM 命中: {solved.answer}")
     if not final_text and options.comment_text:
         final_text = options.comment_text.strip()
-        print("自动答题未命中，回退到 --text")
+        print_ts("自动答题未命中，回退到 --text")
     if not final_text:
         raise EasyMoneyError("未能生成评论内容，请补充 --text 作为回退")
     return final_text
@@ -801,6 +815,7 @@ def cmd_doubao(args: list[str]) -> int:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    configure_timestamped_logging()
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
         reconfigure = getattr(stream, "reconfigure", None)

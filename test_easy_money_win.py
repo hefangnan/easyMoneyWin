@@ -6,6 +6,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 import easy_money_win as em
+import easy_money_win_capture as em_capture
 import easy_money_win_commands as em_commands
 import easy_money_win_core as em_core
 import easy_money_win_llm as em_llm
@@ -249,6 +250,43 @@ class EasyMoneyWinTests(unittest.TestCase):
         self.assertEqual(options.rounds, 2)
         self.assertTrue(options.timing_detail)
 
+    def test_parse_comment_options_collects_vision_save_path(self):
+        options = em.parse_comment_options([
+            "--LLM",
+            "--vision",
+            "--save-vision-image",
+            "--vision-output",
+            "vision.png",
+            "--user",
+            "fn",
+        ])
+
+        self.assertTrue(options.use_llm)
+        self.assertTrue(options.use_vision)
+        self.assertTrue(options.save_vision_image)
+        self.assertEqual(options.vision_save_path, Path("vision.png"))
+
+    def test_parse_comment_options_rejects_vision_save_without_vision(self):
+        with self.assertRaises(em.EasyMoneyError):
+            em.parse_comment_options(["--LLM", "--save-vision-image", "--user", "fn"])
+
+    def test_extract_inline_image_count_supports_chinese_and_digits(self):
+        self.assertEqual(em.extract_inline_image_count("正文\n包含3张图片"), 3)
+        self.assertEqual(em.extract_inline_image_count("这条含两张图片"), 2)
+        self.assertEqual(em.extract_inline_image_count("包含十二张图片"), 9)
+        self.assertIsNone(em.extract_inline_image_count("没有图片提示"))
+
+    def test_direct_uia_inline_image_rects_match_swift_grid(self):
+        body = em.Rect(100, 200, 500, 600)
+        window = em.Rect(0, 0, 1000, 1000)
+
+        rects = em.direct_uia_inline_image_rects(body, 5, window)
+
+        self.assertEqual(len(rects), 5)
+        self.assertEqual(rects[0], em.Rect(176, 324, 296, 444))
+        self.assertEqual(rects[2], em.Rect(424, 324, 544, 444))
+        self.assertEqual(rects[3], em.Rect(176, 448, 296, 568))
+
     def test_parse_comment_options_rejects_removed_local_kb_flags(self):
         with self.assertRaises(em.EasyMoneyError):
             em.parse_comment_options(["--text", "好看", "--user", "fn", "--noLocal"])
@@ -262,6 +300,8 @@ class EasyMoneyWinTests(unittest.TestCase):
             ["--text", "好看", "--user", "fn", "--fast"],
             ["--text", "好看", "--user", "fn", "--fast-send"],
             ["--text", "好看", "--user", "fn", "--slove-question"],
+            ["--text", "好看", "--user", "fn", "--yolo-debug"],
+            ["--text", "好看", "--user", "fn", "--save-yolo-images"],
         ):
             with self.subTest(args=args):
                 with self.assertRaises(em.EasyMoneyError):
@@ -396,6 +436,35 @@ class EasyMoneyWinTests(unittest.TestCase):
 
         self.assertEqual((frame.width, frame.height), (4, 3))
         self.assertEqual(backend._sct.region["left"], -20)
+
+    def test_capture_backend_uses_numpy_dxgi_processor(self):
+        old_import_module = em_capture.importlib.import_module
+        calls: list[dict[str, object]] = []
+
+        class FakeDxCamera:
+            is_capturing = False
+
+            def stop(self) -> None:
+                pass
+
+        class FakeDxcam:
+            @staticmethod
+            def create(**kwargs) -> FakeDxCamera:
+                calls.append(kwargs)
+                return FakeDxCamera()
+
+        def fake_import_module(name: str):
+            if name == "dxcam":
+                return FakeDxcam
+            return old_import_module(name)
+
+        try:
+            em_capture.importlib.import_module = fake_import_module
+            em_capture.CaptureBackend("dxgi")
+        finally:
+            em_capture.importlib.import_module = old_import_module
+
+        self.assertEqual(calls[0]["processor_backend"], "numpy")
 
 if __name__ == "__main__":
     unittest.main()

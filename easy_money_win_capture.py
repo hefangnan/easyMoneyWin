@@ -18,7 +18,15 @@ class CaptureBackend:
             try:
                 self._dxcam_mod = importlib.import_module("dxcam")
                 output_idx = int(os.environ.get("EASYMONEY_DXGI_OUTPUT", "0"))
-                self._dx_camera = self._dxcam_mod.create(output_idx=output_idx, output_color="RGB")
+                processor_backend = (os.environ.get("EASYMONEY_DXGI_PROCESSOR_BACKEND") or "numpy").strip().lower()
+                try:
+                    self._dx_camera = self._dxcam_mod.create(
+                        output_idx=output_idx,
+                        output_color="RGB",
+                        processor_backend=processor_backend,
+                    )
+                except TypeError:
+                    self._dx_camera = self._dxcam_mod.create(output_idx=output_idx, output_color="RGB")
                 if self._dx_camera is not None:
                     self.backend = "dxgi"
                     dxgi_ready = True
@@ -112,7 +120,11 @@ class CaptureBackend:
         except Exception as exc:
             return self._grab_mss_fallback(rect, exc)
         if frame is None:
-            raise EasyMoneyError(f"DXGI 流采帧失败: {rect.describe()}")
+            self._stop_dx_stream()
+            try:
+                return self.grab(rect)
+            except Exception as exc:
+                return self._grab_mss_fallback(rect, exc)
         height, width = int(frame.shape[0]), int(frame.shape[1])
         return CaptureFrame(width=width, height=height, rgb=frame.tobytes())
 
@@ -127,6 +139,10 @@ class CaptureBackend:
 
     def screenshot(self, rect: Rect):
         shot = self.grab(rect)
+        return self.Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
+
+    def screenshot_stream(self, rect: Rect):
+        shot = self.grab_stream(rect)
         return self.Image.frombytes("RGB", (shot.width, shot.height), shot.rgb)
 
     def save(self, image: Any, path: Path) -> Path:

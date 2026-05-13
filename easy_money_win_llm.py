@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from easy_money_win_core import *
 from easy_money_win_capture import CaptureBackend
 
@@ -295,7 +297,7 @@ def request_llm_answer(
 def ask_local_llm(prompt: str, context: str = "") -> Optional[str]:
     config = load_local_llm_config()
     if not config:
-        print("LLM 配置缺失：请设置 EASYMONEY_LLM_MODEL 或 DOUBAO/ARK_MODEL")
+        print_ts("LLM 配置缺失：请设置 EASYMONEY_LLM_MODEL 或 DOUBAO/ARK_MODEL")
         return None
     return request_llm_answer(config, generic_llm_system_prompt(), build_generic_llm_user_prompt(prompt, context))
 
@@ -303,7 +305,7 @@ def ask_local_llm(prompt: str, context: str = "") -> Optional[str]:
 def ask_doubao_to_solve_post(post_text: str, image_data_urls: Optional[list[str]] = None) -> Optional[SolvedQuestion]:
     config = load_local_llm_config()
     if not config:
-        print("豆包/LLM 配置缺失：请检查 .easyMoney.env")
+        print_ts("豆包/LLM 配置缺失：请检查 .easyMoney.env")
         return None
     answer = request_llm_answer(config, doubao_question_solve_system_prompt(), build_doubao_question_prompt(post_text), image_data_urls=image_data_urls)
     if not answer:
@@ -332,25 +334,211 @@ def capture_post_image(post: MomentPostResolution, window_rect: Rect) -> Any:
         capture.close()
 
 
-def capture_yolo_image_data_urls(post: MomentPostResolution, window_rect: Rect) -> list[str]:
-    model_path = expand_path(first_non_empty_env(["EASYMONEY_YOLO_MODEL", "EASYMONEY_DOUBAO_IMAGE_MODEL", "DOUBAO_IMAGE_REGION_MODEL"]))
-    if model_path is None or not model_path.exists():
-        raise EasyMoneyError("--LLM --vision 需要配置 EASYMONEY_YOLO_MODEL 指向 .pt 模型")
-    ultralytics = require_module("ultralytics")
-    cv2 = require_module("cv2", "opencv-python")
-    np = require_module("numpy")
-    image = capture_post_image(post, window_rect)
-    arr = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
-    conf = float(first_non_empty_env(["EASYMONEY_YOLO_CONF", "YOLO_CONF"]) or "0.25")
-    model = ultralytics.YOLO(str(model_path))
-    result = model.predict(arr, imgsz=640, conf=conf, verbose=False)[0]
-    boxes = getattr(result, "boxes", None)
-    if boxes is None or len(boxes) == 0:
-        raise EasyMoneyError("YOLO 未检测到图片区域")
-    best = max(boxes, key=lambda box: float(box.conf[0]) if box.conf is not None else 0.0)
-    x1, y1, x2, y2 = [int(v) for v in best.xyxy[0].tolist()]
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(image.width, x2), min(image.height, y2)
-    cropped = image.crop((x1, y1, x2, y2)) if x2 > x1 and y2 > y1 else image
-    return [image_to_data_url(cropped)]
+def direct_uia_inline_image_rects(body_frame: Rect, image_count: int, window_rect: Rect) -> list[Rect]:
+    count = max(1, min(image_count, 9))
+    side = 120.0
+    gap = 4.0
+    left = body_frame.left + 76.0
+    bottom = body_frame.bottom - 32.0
+    window_inner = window_rect.inset(8, 8)
+
+    rects: list[Rect] = []
+    for index in range(count):
+        if count in {2, 3}:
+            col = index
+            row = 0
+            rows_above_bottom = 0
+        elif count == 4:
+            col = index % 2
+            row = index // 2
+            rows_above_bottom = 1 - row
+        elif count in {5, 6}:
+            col = index if index < 3 else index - 3
+            row = 0 if index < 3 else 1
+            rows_above_bottom = 1 - row
+        else:
+            col = index % 3
+            row = index // 3
+            rows_above_bottom = 2 - row
+
+        rect_bottom = bottom - rows_above_bottom * (side + gap)
+        rect = Rect(
+            left + col * (side + gap),
+            rect_bottom - side,
+            left + col * (side + gap) + side,
+            rect_bottom,
+        ).clamp_to(window_inner)
+        if rect.width > 24 and rect.height > 24:
+            rects.append(rect)
+    return rects
+
+
+def inline_image_rows(image_count: int) -> list[list[int]]:
+    count = max(1, min(image_count, 9))
+    if count == 2:
+        return [[0, 1]]
+    if count == 3:
+        return [[0, 1, 2]]
+    if count == 4:
+        return [[0, 1], [2, 3]]
+    if count == 5:
+        return [[0, 1, 2], [3, 4]]
+    if count == 6:
+        return [[0, 1, 2], [3, 4, 5]]
+    if count == 7:
+        return [[0, 1, 2], [3, 4, 5], [6]]
+    if count == 8:
+        return [[0, 1, 2], [3, 4, 5], [6, 7]]
+    if count == 9:
+        return [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+    return [[0]]
+
+
+def image_crop_box_from_screen_rect(screen_rect: Rect, source_frame: Rect, image: Any) -> tuple[int, int, int, int]:
+    scale_x = image.width / max(1.0, source_frame.width)
+    scale_y = image.height / max(1.0, source_frame.height)
+    left = math.floor((screen_rect.left - source_frame.left) * scale_x)
+    top = math.floor((screen_rect.top - source_frame.top) * scale_y)
+    right = math.ceil((screen_rect.right - source_frame.left) * scale_x)
+    bottom = math.ceil((screen_rect.bottom - source_frame.top) * scale_y)
+    return (
+        max(0, min(image.width, left)),
+        max(0, min(image.height, top)),
+        max(0, min(image.width, right)),
+        max(0, min(image.height, bottom)),
+    )
+
+
+def inline_image_looks_loaded(image: Any) -> bool:
+    rgb = image.convert("RGB")
+    width, height = rgb.size
+    step_x = max(1, width // 32)
+    step_y = max(1, height // 32)
+    pixels = rgb.load()
+    samples = 0
+    bright_low_chroma = 0
+    dark_or_colorful = 0
+    brightness_sum = 0.0
+    brightness_squared_sum = 0.0
+
+    for y in range(0, height, step_y):
+        for x in range(0, width, step_x):
+            r, g, b = pixels[x, y]
+            max_rgb = max(r, g, b)
+            min_rgb = min(r, g, b)
+            chroma = max_rgb - min_rgb
+            brightness = (r + g + b) / 3.0
+            samples += 1
+            brightness_sum += brightness
+            brightness_squared_sum += brightness * brightness
+            if brightness >= 224 and chroma <= 18:
+                bright_low_chroma += 1
+            if brightness <= 210 or chroma >= 24:
+                dark_or_colorful += 1
+
+    if samples <= 0:
+        return False
+    bright_low_chroma_ratio = bright_low_chroma / samples
+    dark_or_colorful_ratio = dark_or_colorful / samples
+    mean = brightness_sum / samples
+    variance = max(0.0, brightness_squared_sum / samples - mean * mean)
+    stddev = math.sqrt(variance)
+    return not (bright_low_chroma_ratio >= 0.92 and dark_or_colorful_ratio <= 0.05 and stddev <= 18)
+
+
+def capture_uia_inline_image_regions(post: MomentPostResolution, window_rect: Rect, image_count: int) -> list[Any]:
+    rects = direct_uia_inline_image_rects(post.body_frame, image_count, window_rect)
+    if not rects:
+        return []
+    timeout_ms = max(
+        80,
+        min(
+            int(first_non_empty_env(["EASYMONEY_AX_IMAGE_LOAD_TIMEOUT_MS", "EASYMONEY_DOUBAO_AX_IMAGE_LOAD_TIMEOUT_MS"]) or "1200"),
+            8000,
+        ),
+    )
+    interval_ms = max(
+        0,
+        min(
+            int(first_non_empty_env(["EASYMONEY_AX_IMAGE_LOAD_INTERVAL_MS", "EASYMONEY_DOUBAO_AX_IMAGE_LOAD_INTERVAL_MS"]) or "0"),
+            1000,
+        ),
+    )
+    deadline = time.perf_counter() + timeout_ms / 1000.0
+    loaded: list[Any | None] = [None] * len(rects)
+    attempts = 0
+    capture = CaptureBackend()
+    try:
+        while time.perf_counter() < deadline and any(image is None for image in loaded):
+            full_window_image = capture.screenshot_stream(window_rect)
+            attempts += 1
+            for index, screen_rect in enumerate(rects):
+                if loaded[index] is not None:
+                    continue
+                left, top, right, bottom = image_crop_box_from_screen_rect(screen_rect, window_rect, full_window_image)
+                if right - left <= 1 or bottom - top <= 1:
+                    continue
+                cropped = full_window_image.crop((left, top, right, bottom))
+                if inline_image_looks_loaded(cropped):
+                    loaded[index] = cropped
+            if any(image is None for image in loaded) and interval_ms > 0:
+                time.sleep(interval_ms / 1000.0)
+    finally:
+        capture.close()
+
+    images = [image for image in loaded if image is not None]
+    if len(images) < len(rects):
+        print_ts(f"  UIA图片加载等待超时: 已加载{len(images)}/{len(rects)}，尝试{attempts}帧，等待{timeout_ms}ms")
+    else:
+        print_ts(f"  UIA图片加载完成: {len(images)}/{len(rects)}，尝试{attempts}帧")
+    return images
+
+
+def stitch_inline_images(images: list[Any], image_count: int) -> Any | None:
+    rows = inline_image_rows(image_count)
+    if not images or not rows:
+        return None
+    tile_width = min(image.width for image in images)
+    tile_height = min(image.height for image in images)
+    if tile_width <= 0 or tile_height <= 0:
+        return None
+    columns = max(len(row) for row in rows)
+    image_module = require_module("PIL.Image", "Pillow")
+    stitched = image_module.new("RGB", (columns * tile_width, len(rows) * tile_height), "white")
+    for row_index, row in enumerate(rows):
+        for column_index, image_index in enumerate(row):
+            if image_index < 0 or image_index >= len(images):
+                continue
+            image = images[image_index].convert("RGB")
+            if image.size != (tile_width, tile_height):
+                image = image.resize((tile_width, tile_height))
+            stitched.paste(image, (column_index * tile_width, row_index * tile_height))
+    return stitched
+
+
+def capture_vision_image_data_urls(
+    post: MomentPostResolution,
+    window_rect: Rect,
+    save_path: Optional[Path] = None,
+) -> list[str]:
+    image_count = post.inline_image_count or extract_inline_image_count(post.text)
+    if image_count is not None and 2 <= image_count <= 9:
+        images = capture_uia_inline_image_regions(post, window_rect, image_count)
+        if len(images) != image_count:
+            raise EasyMoneyError(f"--LLM --vision UIA直接裁剪数量不完整: {len(images)}/{image_count}")
+        stitched = stitch_inline_images(images, image_count)
+        if stitched is None:
+            raise EasyMoneyError("--LLM --vision UIA裁剪图拼接失败")
+        image = stitched
+        print_ts(f"  UIA裁剪图已去除4px间隔并拼接: {image.width}x{image.height}")
+    else:
+        if image_count is None:
+            print_ts("  UIA未检测到图片数量，使用整条动态区域截图")
+        else:
+            print_ts(f"  UIA检测到该动态包含{image_count}张图片，使用整条动态区域截图")
+        image = capture_post_image(post, window_rect)
+    if save_path is not None:
+        ensure_parent(save_path)
+        image.save(save_path)
+    return [image_to_data_url(image)]
 

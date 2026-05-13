@@ -717,6 +717,7 @@ def resolve_second_uia_list_item_post(
         expected_user_id=expected_user_id.strip(),
         detected_prefix=prefix,
         elapsed_ms=elapsed_ms,
+        inline_image_count=extract_inline_image_count(raw_text) if include_text else None,
     )
 
 

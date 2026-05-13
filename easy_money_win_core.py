@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import importlib
+import logging
 import os
 import re
 import sys
@@ -198,6 +199,7 @@ class MomentPostResolution:
     action_point: Point
     text: str
     source: str
+    inline_image_count: Optional[int] = None
 
 
 @dataclass
@@ -209,6 +211,7 @@ class UIAListItemResolution:
     expected_user_id: str
     detected_prefix: str
     elapsed_ms: int
+    inline_image_count: Optional[int] = None
 
 
 @dataclass
@@ -218,6 +221,8 @@ class CommentOptions:
     solve_question: bool = False
     use_llm: bool = False
     use_vision: bool = False
+    save_vision_image: bool = False
+    vision_save_path: Optional[Path] = None
     debug: bool = False
     save_post_image: bool = False
     save_path: Optional[Path] = None
@@ -406,6 +411,24 @@ def current_timestamp_ms() -> str:
     return f"{time.strftime('%H:%M:%S', time.localtime(now))}.{millis:03d}"
 
 
+def print_ts(message: str) -> None:
+    print(f"[{current_timestamp_ms()}] {message}")
+
+
+def configure_timestamped_logging() -> None:
+    class SuppressDxcamSingletonWarning(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            return "DXCamera instance already exists" not in record.getMessage()
+
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="[%(asctime)s.%(msecs)03d] %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+    logging.getLogger("dxcam").addFilter(SuppressDxcamSingletonWarning())
+
+
 BLOCKED_TEXT_SNIPPETS = {
     "评论",
     "赞",
@@ -419,3 +442,57 @@ BLOCKED_TEXT_SNIPPETS = {
     "详情",
     "收起",
 }
+
+
+def chinese_image_count_value(raw: str) -> Optional[int]:
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    values = {
+        "一": 1,
+        "二": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+    }
+    if text == "十":
+        return 10
+    if text.startswith("十") and len(text) > 1:
+        ones = values.get(text[-1])
+        return 10 + ones if ones is not None else None
+    if text.endswith("十") and len(text) > 1:
+        tens = values.get(text[0])
+        return tens * 10 if tens is not None else None
+    if "十" in text:
+        first, _, last = text.partition("十")
+        tens = values.get(first[:1])
+        ones = values.get(last[:1])
+        if tens is not None and ones is not None:
+            return tens * 10 + ones
+    if len(text) == 1:
+        return values.get(text)
+    return None
+
+
+def extract_inline_image_count(text: str) -> Optional[int]:
+    patterns = (
+        r"包含\s*([0-9一二两三四五六七八九十]+)\s*张图片",
+        r"含\s*([0-9一二两三四五六七八九十]+)\s*张图片",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        value = chinese_image_count_value(match.group(1))
+        if value is not None:
+            return max(1, min(value, 9))
+    return None

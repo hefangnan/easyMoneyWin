@@ -2,7 +2,7 @@
 
 `easy_money_win.py` 是 `easyMoney.swift` 的 Windows 第一版迁移入口。具体实现按功能拆在 `easy_money_win_core.py`、`easy_money_win_input.py`、`easy_money_win_capture.py`、`easy_money_win_uia.py`、`easy_money_win_llm.py`、`easy_money_win_commands.py`。它优先保留常用工作流：微信朋友圈窗口定位、按 `locate` 保存的刷新按钮坐标自动刷新、通过 UI Automation 读取朋友圈 `sns_list` 的第二条 `ListItem` 来匹配目标动态、自动评论、LLM/豆包答题、SQLite 知识库查询。
 
-这不是 Swift 版的逐行复刻。macOS 的 `AXUIElement`、`CGEvent`、`ScreenCaptureKit`、`Vision`、`CoreML` 在 Windows 上分别替换为 UI Automation、Win32 输入、DXGI Desktop Duplication（`dxcam`，`mss` 兜底）、可选 OpenCV/YOLO。第一版不默认启用 OCR，也不迁移 CoreML。
+这不是 Swift 版的逐行复刻。macOS 的 `AXUIElement`、`CGEvent`、`ScreenCaptureKit`、`Vision`、`CoreML` 在 Windows 上分别替换为 UI Automation、Win32 输入、DXGI Desktop Duplication（`dxcam`，`mss` 兜底）和普通截图视觉输入。第一版不默认启用 OCR，也不迁移 CoreML。
 
 ## 安装
 
@@ -103,6 +103,8 @@ python .\easy_money_win.py run --interval 15
 python .\easy_money_win.py comment --solve-question --user 方南
 python .\easy_money_win.py comment --doubao --user 方南
 python .\easy_money_win.py comment --LLM --user 方南
+python .\easy_money_win.py comment --LLM --vision --user 方南
+python .\easy_money_win.py comment --LLM --vision --save-vision-image --vision-output .\vision.png --user 方南 --debug
 python .\easy_money_win.py llm ask "问题"
 python .\easy_money_win.py doubao ask "朋友圈正文"
 ```
@@ -116,22 +118,11 @@ python -m py_compile .\easy_money_win.py
 python -m unittest discover -s tests
 ```
 
-## YOLO / 视觉能力
+## 视觉能力
 
-`--LLM --vision` 需要额外安装 `ultralytics` 并配置模型：
+`--LLM --vision` 不再依赖额外目标检测模型或视觉推理库。脚本会优先读取 UIA 正文中的“包含 x 张图片”提示；检测到 2-9 张图片时，按 Swift 版相同的相对坐标裁剪图片网格、去除 4px 间隔并拼接成一张图发给 LLM。其他情况会回退为当前动态正文/图片附近区域截图。
 
-```powershell
-python -m pip install ultralytics
-```
-
-`.easyMoney.env`：
-
-```env
-EASYMONEY_YOLO_MODEL=C:\path\to\best.pt
-EASYMONEY_YOLO_CONF=0.25
-```
-
-没有模型或未安装 `ultralytics` 时，Windows 版会明确报错，而不会静默假装识别成功。
+如果要查看实际发给 LLM 的截图，加 `--save-vision-image`。不指定 `--vision-output` 时会保存到 `%USERPROFILE%\test\wechat_vision_image_时间戳.png`；加 `--debug` 可以只调试定位和内容，不发送评论。
 
 ## Windows 注意事项
 

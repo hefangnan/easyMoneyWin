@@ -82,7 +82,7 @@ python .\easy_money_win.py comment --text "好看！" --user 方南
 
 默认使用分段链路：点击动态右下角操作按钮、通过 `Tab+Enter` 打开评论输入框、输入评论文本、再按已标定的发送按钮坐标执行鼠标点击发送。日志会分别输出 `点操作`、`打开评论`、`输入`、`发送点击` 四段耗时。评论文本优先走 `KEYEVENTF_UNICODE` 直接输入，逻辑对应 Swift 版的 `keyboardSetUnicodeString`；只有超长文本或控制字符等不适合直输的内容才回退剪贴板。脚本发送评论时不会恢复原剪贴板内容。
 
-如需对比纯快捷键发送链路，可以显式指定 `--submit-mode keys` 或 `--submit-keys tab,tab,tab,enter`。
+如需对比纯快捷键发送链路，可以显式指定 `--submit-mode keys`。
 
 ```powershell
 python .\easy_money_win.py comment --text "好看！" --user 方南

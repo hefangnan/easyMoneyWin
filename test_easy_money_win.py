@@ -232,29 +232,32 @@ class EasyMoneyWinTests(unittest.TestCase):
             "好看",
             "--user",
             "fn",
-            "--submit-enter",
+            "--submit-mode",
+            "keys",
             "--rounds",
             "2",
-            "--fast",
             "--timing-detail",
         ])
 
         self.assertEqual(options.comment_text, "好看")
         self.assertEqual(options.requested_user, "fn")
         self.assertEqual(options.submit_mode, "keys")
-        self.assertEqual(options.submit_comment_keys_override, ("enter",))
         self.assertEqual(options.rounds, 2)
-        self.assertTrue(options.fast_send)
         self.assertTrue(options.timing_detail)
 
     def test_parse_comment_options_rejects_removed_local_kb_flags(self):
         with self.assertRaises(em.EasyMoneyError):
             em.parse_comment_options(["--text", "好看", "--user", "fn", "--noLocal"])
 
-    def test_parse_comment_options_rejects_removed_open_flags(self):
+    def test_parse_comment_options_rejects_removed_comment_flags(self):
         for args in (
             ["--text", "好看", "--user", "fn", "--open-click"],
             ["--text", "好看", "--user", "fn", "--open-key-sequence", "tab,enter"],
+            ["--text", "好看", "--user", "fn", "--submit-enter"],
+            ["--text", "好看", "--user", "fn", "--submit-keys", "enter"],
+            ["--text", "好看", "--user", "fn", "--fast"],
+            ["--text", "好看", "--user", "fn", "--fast-send"],
+            ["--text", "好看", "--user", "fn", "--slove-question"],
         ):
             with self.subTest(args=args):
                 with self.assertRaises(em.EasyMoneyError):
@@ -355,133 +358,6 @@ class EasyMoneyWinTests(unittest.TestCase):
                     os.environ.pop("EASYMONEY_SUBMIT_MODE", None)
                 else:
                     os.environ["EASYMONEY_SUBMIT_MODE"] = old_submit_mode
-
-    def test_fast_send_combines_open_keys_and_text(self):
-        events: list[tuple[str, object]] = []
-
-        class FakeInputBackend:
-            def prepare_key_sequence(self, keys) -> None:
-                events.append(("prepare_key_sequence", tuple(keys)))
-
-            def prepare_mouse_click(self, clicks: int = 1) -> None:
-                events.append(("prepare_mouse_click", clicks))
-
-            def prepare_text_input(self, text: str) -> None:
-                events.append(("prepare_text_input", text))
-
-            def prepare_key_sequence_and_text_input(self, keys, text: str) -> None:
-                events.append(("prepare_combined", (tuple(keys), text)))
-
-            def can_type_directly(self, text: str) -> bool:
-                return True
-
-            def can_type_text_directly(self, text: str) -> bool:
-                return True
-
-            def click(self, point: em.Point, clicks: int = 1, interval: float = 0.04) -> None:
-                events.append(("click", (int(point.x), int(point.y), clicks, interval)))
-
-            def press_sequence_and_type_text_directly(self, keys, text: str) -> str:
-                events.append(("combined", (tuple(keys), text)))
-                return "Unicode直接输入"
-
-            def type_text_directly(self, text: str) -> str:
-                events.append(("type", text))
-                return "直接键盘输入"
-
-            def press_sequence_atomic(self, keys) -> None:
-                events.append(("press_sequence_atomic", tuple(keys)))
-
-        plan = em.CommentSendPlan(
-            text="好看",
-            action_point=em.Point(10, 20),
-            send_point=em.Point(50, 60),
-            send_point_method="手动偏移",
-            submit_mode="click",
-            open_comment_keys=("tab", "enter"),
-            submit_comment_keys=("tab", "tab", "tab", "enter"),
-            submit_method="点击发送按钮[手动偏移]",
-            fast_send=True,
-        )
-
-        result = em.execute_comment_send_plan(plan, FakeInputBackend())
-
-        self.assertEqual(result.text_input_method, "Unicode直接输入")
-        self.assertEqual(
-            [event[0] for event in events if event[0] in {"combined", "type", "press_sequence_atomic"}],
-            ["combined"],
-        )
-        self.assertEqual([event for event in events if event[0] == "click"], [
-            ("click", (10, 20, 1, 0.0)),
-            ("click", (50, 60, 1, 0.0)),
-        ])
-
-    def test_fast_send_combines_open_text_and_submit_keys(self):
-        events: list[tuple[str, object]] = []
-
-        class FakeInputBackend:
-            def prepare_key_sequence(self, keys) -> None:
-                events.append(("prepare_key_sequence", tuple(keys)))
-
-            def prepare_mouse_click(self, clicks: int = 1) -> None:
-                events.append(("prepare_mouse_click", clicks))
-
-            def prepare_text_input(self, text: str) -> None:
-                events.append(("prepare_text_input", text))
-
-            def prepare_key_sequence_and_text_input(self, keys, text: str) -> None:
-                events.append(("prepare_combined_open_text", (tuple(keys), text)))
-
-            def prepare_key_sequence_text_and_key_sequence_input(self, open_keys, text: str, submit_keys) -> None:
-                events.append(("prepare_full", (tuple(open_keys), text, tuple(submit_keys))))
-
-            def can_type_directly(self, text: str) -> bool:
-                return True
-
-            def can_type_text_directly(self, text: str) -> bool:
-                return True
-
-            def click(self, point: em.Point, clicks: int = 1, interval: float = 0.04) -> None:
-                events.append(("click", (int(point.x), int(point.y), clicks, interval)))
-
-            def press_sequence_type_text_and_press_sequence_directly(self, open_keys, text: str, submit_keys) -> str:
-                events.append(("full", (tuple(open_keys), text, tuple(submit_keys))))
-                return "Unicode直接输入"
-
-            def press_sequence_and_type_text_directly(self, keys, text: str) -> str:
-                events.append(("combined", (tuple(keys), text)))
-                return "Unicode直接输入"
-
-            def type_text_directly(self, text: str) -> str:
-                events.append(("type", text))
-                return "直接键盘输入"
-
-            def press_sequence_atomic(self, keys) -> None:
-                events.append(("press_sequence_atomic", tuple(keys)))
-
-        plan = em.CommentSendPlan(
-            text="好看",
-            action_point=em.Point(10, 20),
-            send_point=em.Point(50, 60),
-            send_point_method="手动偏移",
-            submit_mode="keys",
-            open_comment_keys=("tab", "enter"),
-            submit_comment_keys=("enter",),
-            submit_method="Enter",
-            fast_send=True,
-        )
-
-        result = em.execute_comment_send_plan(plan, FakeInputBackend())
-
-        self.assertEqual(result.text_input_method, "Unicode直接输入")
-        self.assertEqual(result.send_submit_ms, 0)
-        self.assertEqual(
-            [event[0] for event in events if event[0] in {"full", "combined", "type", "press_sequence_atomic"}],
-            ["full"],
-        )
-        self.assertEqual([event for event in events if event[0] == "click"], [
-            ("click", (10, 20, 1, 0.0)),
-        ])
 
     def test_capture_backend_falls_back_to_mss_for_dxgi_invalid_region(self):
         backend = object.__new__(em.CaptureBackend)

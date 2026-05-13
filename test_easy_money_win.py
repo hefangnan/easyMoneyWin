@@ -2,7 +2,7 @@ import io
 import os
 import tempfile
 import unittest
-from contextlib import closing, redirect_stdout
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import easy_money_win as em
@@ -60,34 +60,6 @@ class EasyMoneyWinTests(unittest.TestCase):
             em.parse_responses_api_response({"output_text": "豆包答案"}),
             "豆包答案",
         )
-
-    def test_sqlite_schema_and_kb_ask(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            old_db = em.CONFIG_KB
-            try:
-                em.CONFIG_KB = Path(tmp) / ".wechat_kb.sqlite"
-                with closing(em.open_knowledge_db(create=True)) as conn:
-                    conn.execute(
-                        "INSERT INTO scripts(title, normalized_title) VALUES (?, ?)",
-                        ("测试剧本", em.normalize_text("测试剧本")),
-                    )
-                    script_id = conn.execute("SELECT id FROM scripts WHERE title='测试剧本'").fetchone()["id"]
-                    conn.execute(
-                        "INSERT INTO qa_pairs(script_id, normalized_question, question, answer, evidence) VALUES (?, ?, ?, ?, ?)",
-                        (
-                            script_id,
-                            em.normalize_text("测试剧本的凶手是谁"),
-                            "测试剧本的凶手是谁",
-                            "张三",
-                            "测试证据",
-                        ),
-                    )
-                    conn.commit()
-                solved = em.solve_question_from_context("测试剧本的凶手是谁")
-                self.assertIsNotNone(solved)
-                self.assertEqual(solved.answer, "张三")
-            finally:
-                em.CONFIG_KB = old_db
 
     def test_window_backend_uses_pywinauto_desktop(self):
         old_require_module = em.require_module
@@ -272,6 +244,10 @@ class EasyMoneyWinTests(unittest.TestCase):
         self.assertEqual(options.submit_mode, "keys")
         self.assertEqual(options.submit_comment_keys_override, ("enter",))
         self.assertEqual(options.rounds, 2)
+
+    def test_parse_comment_options_rejects_removed_local_kb_flags(self):
+        with self.assertRaises(em.EasyMoneyError):
+            em.parse_comment_options(["--text", "好看", "--user", "fn", "--noLocal"])
 
     def test_comment_sends_with_default_click_after_typing(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -37,11 +37,7 @@ Windows 版使用 `Path.home()`，并尽量兼容 Swift 版的文件名：
 
 - `%USERPROFILE%\.wechat_comment_config`
 - `%USERPROFILE%\.wechat_refresh_offset`
-- `%USERPROFILE%\.wechat_kb.sqlite`
 - `%USERPROFILE%\.easyMoney.env`
-- `%USERPROFILE%\.easyMoney\doubaotext-prefix-cache.json`
-
-如果你已有 macOS 版知识库，可把 `~/.wechat_kb.sqlite` 复制到 Windows 的 `%USERPROFILE%\.wechat_kb.sqlite`。
 
 ## LLM / 豆包配置
 
@@ -111,11 +107,8 @@ python .\easy_money_win.py locate
 python .\easy_money_win.py capture-info --backend dxgi
 python .\easy_money_win.py run --interval 15
 python .\easy_money_win.py comment --solve-question --user 方南
-python .\easy_money_win.py comment --doubao --noLocal --user 方南
+python .\easy_money_win.py comment --doubao --user 方南
 python .\easy_money_win.py comment --LLM --user 方南
-python .\easy_money_win.py kb stats
-python .\easy_money_win.py kb search "关键词"
-python .\easy_money_win.py kb ask "问题" --store "商家名"
 python .\easy_money_win.py llm ask "问题"
 python .\easy_money_win.py doubao ask "朋友圈正文"
 ```

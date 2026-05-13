@@ -2,23 +2,20 @@
 """Windows Python port of easyMoney.swift.
 
 This is a practical first Windows version, not a one-to-one Swift rewrite.
-The UI layer uses Windows UI Automation plus coordinate fallbacks; KB and LLM
-commands are kept usable without loading UI automation dependencies.
+The UI layer uses Windows UI Automation plus coordinate fallbacks; LLM commands
+are kept usable without loading UI automation dependencies.
 """
 
 from __future__ import annotations
 
 import base64
 import ctypes
-import hashlib
 import importlib
 import os
 import re
-import sqlite3
 import sys
 import time
 from ctypes import wintypes
-from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -26,7 +23,6 @@ from typing import Any, Callable, Iterable, Optional
 
 APP_NAME = "easyMoney Windows"
 APP_VERSION = "0.1.0"
-SCHEMA_VERSION = 24
 COMMENT_REFRESH_WAIT_SECONDS = 0.1
 COMMENT_REFRESH_CAPTURE_INTERVAL_SECONDS = 0.012
 COMMENT_REFRESH_IDLE_SECONDS = 0.003
@@ -226,11 +222,8 @@ class CommentOptions:
     comment_text: Optional[str] = None
     requested_user: str = ""
     solve_question: bool = False
-    use_doubao: bool = False
     use_llm: bool = False
     use_vision: bool = False
-    no_local: bool = False
-    preferred_store: Optional[str] = None
     debug: bool = False
     save_post_image: bool = False
     save_path: Optional[Path] = None
@@ -274,8 +267,6 @@ CONFIG_REFRESH = HOME / ".wechat_refresh_offset"
 CONFIG_COMMENT = HOME / ".wechat_comment_config"
 CONFIG_POST_IMAGE_TAP_OFFSET = HOME / ".wechat_post_image_tap_offset"
 CONFIG_POST_IMAGE_TAP_X_OFFSET = HOME / ".wechat_post_image_tap_x_offset"
-CONFIG_KB = HOME / ".wechat_kb.sqlite"
-CONFIG_PREFIX_CACHE = EASYMONEY_DIR / "doubaotext-prefix-cache.json"
 ACTION_TEMPLATE = HOME / ".wechat_action_tpl.png"
 DEBUG_DIR = Path(os.environ.get("EASYMONEY_DEBUG_DIR", str(HOME / "test")))
 
@@ -2010,713 +2001,6 @@ def ask_doubao_to_solve_post(post_text: str, image_data_urls: Optional[list[str]
     return SolvedQuestion(answer=answer, evidence="LLM", confidence=0.62, source=config.provider)
 
 
-def sqlite_row_dict(cursor: sqlite3.Cursor, row: sqlite3.Row) -> dict[str, Any]:
-    return {desc[0]: row[idx] for idx, desc in enumerate(cursor.description or [])}
-
-
-def open_knowledge_db(create: bool = True) -> sqlite3.Connection:
-    ensure_parent(CONFIG_KB)
-    conn = sqlite3.connect(str(CONFIG_KB))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=1500")
-    conn.execute("PRAGMA foreign_keys=ON")
-    if create:
-        setup_knowledge_schema(conn)
-    return conn
-
-
-def setup_knowledge_schema(conn: sqlite3.Connection) -> None:
-    statements = [
-        "PRAGMA journal_mode=WAL",
-        """
-        CREATE TABLE IF NOT EXISTS stores (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            canonical_name TEXT NOT NULL,
-            normalized_name TEXT NOT NULL,
-            notes TEXT NOT NULL DEFAULT '',
-            last_seen_at INTEGER DEFAULT (strftime('%s','now')),
-            created_at INTEGER DEFAULT (strftime('%s','now')),
-            UNIQUE(normalized_name)
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS scripts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            normalized_title TEXT NOT NULL DEFAULT '',
-            host_name TEXT NOT NULL DEFAULT '',
-            variant TEXT NOT NULL DEFAULT '',
-            store_id INTEGER REFERENCES stores(id),
-            common_script_id INTEGER REFERENCES scripts(id),
-            created_at INTEGER DEFAULT (strftime('%s','now')),
-            UNIQUE(title, host_name, variant)
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            raw_text TEXT NOT NULL,
-            source_type TEXT NOT NULL DEFAULT 'auto',
-            store_id INTEGER REFERENCES stores(id),
-            post_date INTEGER,
-            content_signature TEXT NOT NULL DEFAULT '',
-            created_at INTEGER DEFAULT (strftime('%s','now'))
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS post_scripts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            post_id INTEGER NOT NULL REFERENCES posts(id),
-            script_id INTEGER NOT NULL REFERENCES scripts(id),
-            raw_line TEXT,
-            created_at INTEGER DEFAULT (strftime('%s','now')),
-            UNIQUE(post_id, script_id)
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS role_mappings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            script_id INTEGER NOT NULL REFERENCES scripts(id),
-            actor TEXT NOT NULL,
-            npc TEXT NOT NULL,
-            raw_line TEXT,
-            source_confidence REAL DEFAULT 0.8,
-            last_seen_at INTEGER DEFAULT (strftime('%s','now')),
-            created_at INTEGER DEFAULT (strftime('%s','now')),
-            UNIQUE(script_id, actor, npc)
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS script_characters (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            script_id INTEGER NOT NULL REFERENCES scripts(id),
-            character_name TEXT NOT NULL,
-            alias TEXT NOT NULL DEFAULT '',
-            gender_tag TEXT NOT NULL DEFAULT '',
-            raw_text TEXT,
-            source_confidence REAL DEFAULT 0.8,
-            last_seen_at INTEGER DEFAULT (strftime('%s','now')),
-            created_at INTEGER DEFAULT (strftime('%s','now')),
-            UNIQUE(script_id, character_name)
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS script_roles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            script_id INTEGER NOT NULL REFERENCES scripts(id),
-            canonical_name TEXT NOT NULL,
-            gender_tag TEXT NOT NULL DEFAULT '',
-            role_kind TEXT NOT NULL DEFAULT 'unknown',
-            is_player INTEGER NOT NULL DEFAULT 0,
-            is_non_player INTEGER NOT NULL DEFAULT 0,
-            is_npc INTEGER NOT NULL DEFAULT 0,
-            is_dm_role INTEGER NOT NULL DEFAULT 0,
-            is_companion_npc INTEGER NOT NULL DEFAULT 0,
-            raw_text TEXT NOT NULL DEFAULT '',
-            summary TEXT NOT NULL DEFAULT '',
-            tags TEXT NOT NULL DEFAULT '',
-            source_confidence REAL DEFAULT 0.8,
-            last_seen_at INTEGER DEFAULT (strftime('%s','now')),
-            created_at INTEGER DEFAULT (strftime('%s','now')),
-            UNIQUE(script_id, canonical_name)
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS script_profiles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            script_id INTEGER NOT NULL REFERENCES scripts(id),
-            category TEXT NOT NULL DEFAULT '',
-            author TEXT NOT NULL DEFAULT '',
-            difficulty TEXT NOT NULL DEFAULT '',
-            player_config_text TEXT NOT NULL DEFAULT '',
-            male_count INTEGER,
-            female_count INTEGER,
-            min_players INTEGER,
-            max_players INTEGER,
-            duration_text TEXT NOT NULL DEFAULT '',
-            duration_min_hours REAL,
-            duration_max_hours REAL,
-            summary TEXT NOT NULL DEFAULT '',
-            publisher TEXT NOT NULL DEFAULT '',
-            age_rating TEXT NOT NULL DEFAULT '',
-            release_type TEXT NOT NULL DEFAULT '',
-            cross_gender_allowed INTEGER,
-            last_seen_at INTEGER DEFAULT (strftime('%s','now')),
-            created_at INTEGER DEFAULT (strftime('%s','now')),
-            UNIQUE(script_id)
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS facts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            script_id INTEGER NOT NULL REFERENCES scripts(id),
-            key TEXT NOT NULL,
-            value TEXT NOT NULL,
-            raw_line TEXT,
-            source_confidence REAL DEFAULT 0.8,
-            last_seen_at INTEGER DEFAULT (strftime('%s','now')),
-            created_at INTEGER DEFAULT (strftime('%s','now'))
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS store_offerings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            script_id INTEGER NOT NULL REFERENCES scripts(id),
-            store_id INTEGER NOT NULL REFERENCES stores(id),
-            effective_label TEXT NOT NULL DEFAULT '',
-            effective_from INTEGER,
-            effective_to INTEGER,
-            is_active INTEGER NOT NULL DEFAULT 1,
-            price_text TEXT NOT NULL DEFAULT '',
-            price_value INTEGER,
-            dm_count INTEGER,
-            npc_count INTEGER,
-            config_text TEXT NOT NULL DEFAULT '',
-            notes TEXT NOT NULL DEFAULT '',
-            source_confidence REAL DEFAULT 0.9,
-            last_seen_at INTEGER DEFAULT (strftime('%s','now')),
-            created_at INTEGER DEFAULT (strftime('%s','now')),
-            UNIQUE(script_id, store_id, effective_label)
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS store_castings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            script_id INTEGER NOT NULL REFERENCES scripts(id),
-            store_id INTEGER NOT NULL REFERENCES stores(id),
-            actor_id INTEGER,
-            character_name TEXT NOT NULL,
-            actor_name TEXT NOT NULL,
-            role_kind TEXT NOT NULL DEFAULT 'unknown',
-            card_variant TEXT NOT NULL DEFAULT '',
-            tags TEXT NOT NULL DEFAULT '',
-            effective_label TEXT NOT NULL DEFAULT '',
-            effective_from INTEGER,
-            effective_to INTEGER,
-            is_active INTEGER NOT NULL DEFAULT 1,
-            raw_line TEXT,
-            source_confidence REAL DEFAULT 0.9,
-            last_seen_at INTEGER DEFAULT (strftime('%s','now')),
-            created_at INTEGER DEFAULT (strftime('%s','now'))
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS qa_pairs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            script_id INTEGER REFERENCES scripts(id),
-            normalized_question TEXT NOT NULL,
-            question TEXT NOT NULL,
-            answer TEXT NOT NULL,
-            evidence TEXT,
-            source_confidence REAL DEFAULT 0.9,
-            hit_count INTEGER DEFAULT 0,
-            last_seen_at INTEGER DEFAULT (strftime('%s','now')),
-            created_at INTEGER DEFAULT (strftime('%s','now'))
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS script_aliases (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            script_id INTEGER NOT NULL REFERENCES scripts(id),
-            alias TEXT NOT NULL,
-            source_confidence REAL DEFAULT 0.7,
-            last_seen_at INTEGER DEFAULT (strftime('%s','now')),
-            created_at INTEGER DEFAULT (strftime('%s','now')),
-            UNIQUE(script_id, alias)
-        )
-        """,
-        """
-        CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts USING fts5(
-            content,
-            source_table,
-            source_id UNINDEXED,
-            tokenize='unicode61 remove_diacritics 2'
-        )
-        """,
-        "CREATE INDEX IF NOT EXISTS idx_scripts_title ON scripts(title)",
-        "CREATE INDEX IF NOT EXISTS idx_qa_pairs_question ON qa_pairs(normalized_question)",
-        "PRAGMA user_version=24",
-    ]
-    for sql in statements:
-        try:
-            conn.execute(sql)
-        except sqlite3.Error as exc:
-            if "fts5" in str(exc).lower():
-                print(f"警告: 当前 SQLite 不支持 FTS5，搜索会降级: {exc}")
-            else:
-                raise
-    conn.commit()
-
-
-def normalize_text(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r"\s+", "", text)
-    text = re.sub(r"[，。、“”‘’！!？?：:；;（）()\[\]【】《》<>\"']", "", text)
-    return text
-
-
-def db_table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=? LIMIT 1", (table,)).fetchone()
-    return row is not None
-
-
-def resolve_store_id(conn: sqlite3.Connection, store_name: Optional[str]) -> Optional[int]:
-    if not store_name or not db_table_exists(conn, "stores"):
-        return None
-    norm = normalize_text(store_name)
-    row = conn.execute(
-        "SELECT id FROM stores WHERE normalized_name=? OR canonical_name LIKE ? ORDER BY last_seen_at DESC LIMIT 1",
-        (norm, f"%{store_name}%"),
-    ).fetchone()
-    return int(row["id"]) if row else None
-
-
-def guess_script_ids(conn: sqlite3.Connection, question: str, context: str = "") -> list[int]:
-    if not db_table_exists(conn, "scripts"):
-        return []
-    combined = f"{question}\n{context}"
-    normalized = normalize_text(combined)
-    rows = conn.execute("SELECT id, title, normalized_title FROM scripts ORDER BY length(title) DESC LIMIT 4000").fetchall()
-    hits: list[int] = []
-    for row in rows:
-        title = row["title"] or ""
-        nt = row["normalized_title"] or normalize_text(title)
-        if title and title in combined or nt and nt in normalized:
-            hits.append(int(row["id"]))
-            if len(hits) >= 8:
-                break
-    quoted = re.findall(r"[《「“\"]([^》」”\"]{2,40})[》」”\"]", combined)
-    for title in quoted:
-        row = conn.execute("SELECT id FROM scripts WHERE title LIKE ? ORDER BY created_at DESC LIMIT 1", (f"%{title}%",)).fetchone()
-        if row and int(row["id"]) not in hits:
-            hits.append(int(row["id"]))
-    return hits
-
-
-def sql_scope(script_ids: list[int]) -> tuple[str, list[Any]]:
-    if not script_ids:
-        return "", []
-    placeholders = ",".join("?" for _ in script_ids)
-    return f" AND script_id IN ({placeholders}) ", list(script_ids)
-
-
-def solve_exact_qa(conn: sqlite3.Connection, question: str, script_ids: list[int]) -> Optional[SolvedQuestion]:
-    if not db_table_exists(conn, "qa_pairs"):
-        return None
-    norm = normalize_text(question)
-    scope, params = sql_scope(script_ids)
-    rows = conn.execute(
-        f"""
-        SELECT id, answer, evidence, source_confidence
-        FROM qa_pairs
-        WHERE (normalized_question=? OR question LIKE ?) {scope}
-        ORDER BY source_confidence DESC, hit_count DESC, last_seen_at DESC
-        LIMIT 1
-        """,
-        [norm, f"%{question.strip()}%"] + params,
-    ).fetchall()
-    if not rows:
-        return None
-    row = rows[0]
-    conn.execute("UPDATE qa_pairs SET hit_count = COALESCE(hit_count,0) + 1, last_seen_at=strftime('%s','now') WHERE id=?", (row["id"],))
-    conn.commit()
-    return SolvedQuestion(answer=row["answer"], evidence=row["evidence"] or "qa_pairs", confidence=float(row["source_confidence"] or 0.9), source="qa_pairs")
-
-
-def extract_actor_or_role(question: str, patterns: list[str]) -> Optional[str]:
-    for pattern in patterns:
-        match = re.search(pattern, question)
-        if match:
-            value = match.group(1).strip(" ？?，,。.")
-            if 1 <= len(value) <= 20:
-                return value
-    return None
-
-
-def solve_actor_mapping(conn: sqlite3.Connection, question: str, script_ids: list[int], store_id: Optional[int]) -> Optional[SolvedQuestion]:
-    actor = extract_actor_or_role(question, [r"(.{1,20}?)(?:演谁|演的是谁|饰演谁|扮演谁)", r"(?:演员|dm|npc)?(.{1,20}?)(?:对应|对应的)(?:角色|npc)"])
-    reverse = extract_actor_or_role(question, [r"谁(?:演|饰演|扮演)(.{1,20})", r"(.{1,20})是谁演的"])
-    if actor and db_table_exists(conn, "role_mappings"):
-        scope, params = sql_scope(script_ids)
-        rows = conn.execute(
-            f"""
-            SELECT actor, npc, raw_line, source_confidence
-            FROM role_mappings
-            WHERE actor LIKE ? {scope}
-            ORDER BY source_confidence DESC, last_seen_at DESC
-            LIMIT 5
-            """,
-            [f"%{actor}%"] + params,
-        ).fetchall()
-        if rows:
-            answer = "、".join(dict.fromkeys(row["npc"] for row in rows if row["npc"]))
-            evidence = rows[0]["raw_line"] or f"{rows[0]['actor']} -> {rows[0]['npc']}"
-            return SolvedQuestion(answer=answer, evidence=evidence, confidence=float(rows[0]["source_confidence"] or 0.8), source="role_mappings")
-    if actor and db_table_exists(conn, "store_castings"):
-        scope, params = sql_scope(script_ids)
-        store_sql = " AND store_id=? " if store_id else ""
-        rows = conn.execute(
-            f"""
-            SELECT actor_name, character_name, raw_line, source_confidence
-            FROM store_castings
-            WHERE actor_name LIKE ? {scope} {store_sql}
-            ORDER BY source_confidence DESC, last_seen_at DESC
-            LIMIT 5
-            """,
-            [f"%{actor}%"] + params + ([store_id] if store_id else []),
-        ).fetchall()
-        if rows:
-            answer = "、".join(dict.fromkeys(row["character_name"] for row in rows if row["character_name"]))
-            evidence = rows[0]["raw_line"] or f"{rows[0]['actor_name']} -> {rows[0]['character_name']}"
-            return SolvedQuestion(answer=answer, evidence=evidence, confidence=float(rows[0]["source_confidence"] or 0.8), source="store_castings")
-    if reverse and db_table_exists(conn, "store_castings"):
-        scope, params = sql_scope(script_ids)
-        store_sql = " AND store_id=? " if store_id else ""
-        rows = conn.execute(
-            f"""
-            SELECT actor_name, character_name, raw_line, source_confidence
-            FROM store_castings
-            WHERE character_name LIKE ? {scope} {store_sql}
-            ORDER BY source_confidence DESC, last_seen_at DESC
-            LIMIT 5
-            """,
-            [f"%{reverse}%"] + params + ([store_id] if store_id else []),
-        ).fetchall()
-        if rows:
-            answer = "、".join(dict.fromkeys(row["actor_name"] for row in rows if row["actor_name"]))
-            evidence = rows[0]["raw_line"] or f"{rows[0]['character_name']} <- {rows[0]['actor_name']}"
-            return SolvedQuestion(answer=answer, evidence=evidence, confidence=float(rows[0]["source_confidence"] or 0.8), source="store_castings")
-    return None
-
-
-def solve_profile_lookup(conn: sqlite3.Connection, question: str, script_ids: list[int]) -> Optional[SolvedQuestion]:
-    if not script_ids or not db_table_exists(conn, "script_profiles"):
-        return None
-    key_map = [
-        ("作者", "author"),
-        ("分类", "category"),
-        ("难度", "difficulty"),
-        ("时长", "duration_text"),
-        ("简介", "summary"),
-        ("发行", "publisher"),
-        ("适龄", "age_rating"),
-        ("反串", "cross_gender_allowed"),
-        ("人数", "player_config_text"),
-        ("几人", "player_config_text"),
-    ]
-    column = None
-    label = None
-    for needle, col in key_map:
-        if needle in question:
-            label = needle
-            column = col
-            break
-    if not column:
-        return None
-    placeholders = ",".join("?" for _ in script_ids)
-    row = conn.execute(
-        f"""
-        SELECT s.title, p.*
-        FROM script_profiles p
-        JOIN scripts s ON s.id = p.script_id
-        WHERE p.script_id IN ({placeholders})
-        ORDER BY p.last_seen_at DESC
-        LIMIT 1
-        """,
-        script_ids,
-    ).fetchone()
-    if not row:
-        return None
-    value = row[column]
-    if column == "cross_gender_allowed":
-        value = "可反串" if value == 1 else ("不可反串" if value == 0 else "")
-    if value is None or str(value).strip() == "":
-        return None
-    return SolvedQuestion(answer=str(value), evidence=f"{row['title']} 的 {label}", confidence=0.78, source="script_profiles")
-
-
-def solve_enumeration(conn: sqlite3.Connection, question: str, script_ids: list[int]) -> Optional[SolvedQuestion]:
-    if not script_ids or not db_table_exists(conn, "script_roles"):
-        return None
-    if not any(key in question for key in ["哪些", "所有", "角色", "npc", "NPC", "DM", "dm"]):
-        return None
-    filters = []
-    if "NPC" in question or "npc" in question or "陪伴" in question:
-        filters.append("(is_npc=1 OR is_companion_npc=1 OR role_kind LIKE '%npc%')")
-    if "DM" in question or "dm" in question:
-        filters.append("(is_dm_role=1 OR role_kind='dm')")
-    where_kind = " AND (" + " OR ".join(filters) + ")" if filters else ""
-    placeholders = ",".join("?" for _ in script_ids)
-    rows = conn.execute(
-        f"""
-        SELECT canonical_name, raw_text, source_confidence
-        FROM script_roles
-        WHERE script_id IN ({placeholders}) {where_kind}
-        ORDER BY role_kind, canonical_name
-        LIMIT 30
-        """,
-        script_ids,
-    ).fetchall()
-    if not rows:
-        return None
-    names = [row["canonical_name"] for row in rows if row["canonical_name"]]
-    return SolvedQuestion(answer="、".join(dict.fromkeys(names)), evidence=f"script_roles 命中 {len(rows)} 条", confidence=0.72, source="script_roles")
-
-
-def solve_count(conn: sqlite3.Connection, question: str, script_ids: list[int], store_id: Optional[int]) -> Optional[SolvedQuestion]:
-    if not script_ids or not any(key in question for key in ["几个", "几位", "多少", "数量", "人数"]):
-        return None
-    if store_id and db_table_exists(conn, "store_offerings"):
-        placeholders = ",".join("?" for _ in script_ids)
-        row = conn.execute(
-            f"""
-            SELECT dm_count, npc_count, config_text
-            FROM store_offerings
-            WHERE script_id IN ({placeholders}) AND store_id=? AND is_active=1
-            ORDER BY source_confidence DESC, last_seen_at DESC
-            LIMIT 1
-            """,
-            script_ids + [store_id],
-        ).fetchone()
-        if row:
-            if ("NPC" in question or "npc" in question) and row["npc_count"] is not None:
-                return SolvedQuestion(answer=str(row["npc_count"]), evidence=row["config_text"] or "store_offerings.npc_count", confidence=0.82, source="store_offerings")
-            if ("DM" in question or "dm" in question) and row["dm_count"] is not None:
-                return SolvedQuestion(answer=str(row["dm_count"]), evidence=row["config_text"] or "store_offerings.dm_count", confidence=0.82, source="store_offerings")
-    if db_table_exists(conn, "script_roles"):
-        placeholders = ",".join("?" for _ in script_ids)
-        if "NPC" in question or "npc" in question:
-            row = conn.execute(
-                f"SELECT COUNT(*) AS c FROM script_roles WHERE script_id IN ({placeholders}) AND (is_npc=1 OR is_companion_npc=1 OR role_kind LIKE '%npc%')",
-                script_ids,
-            ).fetchone()
-            if row and row["c"]:
-                return SolvedQuestion(answer=str(row["c"]), evidence="script_roles NPC count", confidence=0.7, source="script_roles")
-        if "DM" in question or "dm" in question:
-            row = conn.execute(
-                f"SELECT COUNT(*) AS c FROM script_roles WHERE script_id IN ({placeholders}) AND (is_dm_role=1 OR role_kind='dm')",
-                script_ids,
-            ).fetchone()
-            if row and row["c"]:
-                return SolvedQuestion(answer=str(row["c"]), evidence="script_roles DM count", confidence=0.7, source="script_roles")
-    return None
-
-
-def solve_fts_fallback(conn: sqlite3.Connection, question: str) -> Optional[SolvedQuestion]:
-    if not db_table_exists(conn, "kb_fts"):
-        return None
-    query = re.sub(r"[\"'():*^~-]+", " ", question).strip()
-    if not query:
-        return None
-    try:
-        rows = conn.execute(
-            """
-            SELECT content, source_table, source_id
-            FROM kb_fts
-            WHERE kb_fts MATCH ?
-            LIMIT 5
-            """,
-            (query,),
-        ).fetchall()
-    except sqlite3.Error:
-        rows = []
-    if not rows:
-        return None
-    content = rows[0]["content"] or ""
-    answer = content.strip().splitlines()[0][:80]
-    return SolvedQuestion(answer=answer, evidence=f"FTS: {rows[0]['source_table']}#{rows[0]['source_id']}", confidence=0.45, source="kb_fts")
-
-
-def solve_question_from_context(question: str, preferred_store: Optional[str] = None, context: str = "") -> Optional[SolvedQuestion]:
-    with closing(open_knowledge_db(create=True)) as conn:
-        store_id = resolve_store_id(conn, preferred_store)
-        script_ids = guess_script_ids(conn, question, context)
-        for solver in [
-            lambda: solve_exact_qa(conn, question, script_ids),
-            lambda: solve_actor_mapping(conn, question, script_ids, store_id),
-            lambda: solve_profile_lookup(conn, question, script_ids),
-            lambda: solve_count(conn, question, script_ids, store_id),
-            lambda: solve_enumeration(conn, question, script_ids),
-            lambda: solve_fts_fallback(conn, question),
-        ]:
-            solved = solver()
-            if solved and solved.answer.strip():
-                return solved
-    return None
-
-
-def rebuild_knowledge_index() -> None:
-    with closing(open_knowledge_db(create=True)) as conn:
-        if not db_table_exists(conn, "kb_fts"):
-            print("当前 SQLite 不支持 FTS5，无法重建索引")
-            return
-        conn.execute("DELETE FROM kb_fts")
-        sources = [
-            ("qa_pairs", "id", "question || '\n' || answer || '\n' || COALESCE(evidence,'')"),
-            ("scripts", "id", "title || '\n' || COALESCE(host_name,'') || '\n' || COALESCE(variant,'')"),
-            ("script_aliases", "id", "alias"),
-            ("facts", "id", "key || '\n' || value || '\n' || COALESCE(raw_line,'')"),
-            ("script_roles", "id", "canonical_name || '\n' || COALESCE(raw_text,'') || '\n' || COALESCE(summary,'')"),
-            ("role_mappings", "id", "actor || '\n' || npc || '\n' || COALESCE(raw_line,'')"),
-            ("store_offerings", "id", "price_text || '\n' || config_text || '\n' || notes"),
-            ("store_castings", "id", "character_name || '\n' || actor_name || '\n' || COALESCE(raw_line,'')"),
-            ("posts", "id", "raw_text"),
-        ]
-        inserted = 0
-        for table, id_col, expr in sources:
-            if not db_table_exists(conn, table):
-                continue
-            rows = conn.execute(f"SELECT {id_col} AS id, {expr} AS content FROM {table}").fetchall()
-            for row in rows:
-                content = (row["content"] or "").strip()
-                if not content:
-                    continue
-                conn.execute("INSERT INTO kb_fts(content, source_table, source_id) VALUES (?, ?, ?)", (content, table, row["id"]))
-                inserted += 1
-        conn.commit()
-        print(f"知识库索引已重建: {inserted} 条")
-
-
-def print_knowledge_stats() -> None:
-    with closing(open_knowledge_db(create=True)) as conn:
-        print(f"知识库: {CONFIG_KB}")
-        print(f"schema version: {conn.execute('PRAGMA user_version').fetchone()[0]}")
-        for table in [
-            "stores",
-            "scripts",
-            "posts",
-            "qa_pairs",
-            "facts",
-            "script_roles",
-            "role_mappings",
-            "store_offerings",
-            "store_castings",
-            "kb_fts",
-        ]:
-            if db_table_exists(conn, table):
-                try:
-                    count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                    print(f"  {table}: {count}")
-                except sqlite3.Error as exc:
-                    print(f"  {table}: 读取失败 {exc}")
-
-
-def search_knowledge(keyword: str) -> None:
-    with closing(open_knowledge_db(create=True)) as conn:
-        rows: list[sqlite3.Row] = []
-        if db_table_exists(conn, "kb_fts"):
-            try:
-                rows = conn.execute(
-                    "SELECT content, source_table, source_id FROM kb_fts WHERE kb_fts MATCH ? LIMIT 20",
-                    (re.sub(r"[\"'():*^~-]+", " ", keyword).strip(),),
-                ).fetchall()
-            except sqlite3.Error:
-                rows = []
-        if not rows:
-            like = f"%{keyword}%"
-            parts: list[tuple[str, int, str]] = []
-            for table, id_col, col in [
-                ("qa_pairs", "id", "question || '\n' || answer"),
-                ("scripts", "id", "title"),
-                ("facts", "id", "key || '\n' || value || '\n' || COALESCE(raw_line,'')"),
-                ("posts", "id", "raw_text"),
-            ]:
-                if not db_table_exists(conn, table):
-                    continue
-                for row in conn.execute(f"SELECT {id_col} AS id, {col} AS content FROM {table} WHERE {col} LIKE ? LIMIT 8", (like,)):
-                    parts.append((table, row["id"], row["content"] or ""))
-            for table, row_id, content in parts[:20]:
-                print(f"[{table}#{row_id}] {content[:160].replace(chr(10), ' / ')}")
-            return
-        for row in rows:
-            print(f"[{row['source_table']}#{row['source_id']}] {(row['content'] or '')[:160].replace(chr(10), ' / ')}")
-
-
-def print_parsed_question(question: str, preferred_store: Optional[str]) -> None:
-    with closing(open_knowledge_db(create=True)) as conn:
-        script_ids = guess_script_ids(conn, question)
-        store_id = resolve_store_id(conn, preferred_store)
-        print(f"问题: {question}")
-        print(f"normalized: {normalize_text(question)}")
-        print(f"store: {preferred_store or '-'} -> {store_id or '-'}")
-        if script_ids:
-            placeholders = ",".join("?" for _ in script_ids)
-            rows = conn.execute(f"SELECT id, title FROM scripts WHERE id IN ({placeholders})", script_ids).fetchall()
-            print("候选剧本:")
-            for row in rows:
-                print(f"  - #{row['id']} {row['title']}")
-        else:
-            print("候选剧本: -")
-        intents = []
-        if any(key in question for key in ["演谁", "谁演", "饰演", "扮演"]):
-            intents.append("actor_mapping")
-        if any(key in question for key in ["几个", "几位", "多少", "数量"]):
-            intents.append("count")
-        if any(key in question for key in ["哪些", "所有", "角色"]):
-            intents.append("enumeration")
-        if any(key in question for key in ["作者", "分类", "难度", "时长", "简介", "发行", "反串"]):
-            intents.append("profile_lookup")
-        print(f"意图: {', '.join(intents) if intents else 'unknown'}")
-
-
-def learn_knowledge_from_clipboard() -> None:
-    pyperclip = require_module("pyperclip")
-    text = (pyperclip.paste() or "").strip()
-    if not text:
-        print("剪贴板为空")
-        return
-    signature = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    with closing(open_knowledge_db(create=True)) as conn:
-        row = conn.execute("SELECT id FROM posts WHERE content_signature=? LIMIT 1", (signature,)).fetchone()
-        if row:
-            print(f"剪贴板内容已存在 posts#{row['id']}")
-            return
-        cur = conn.execute(
-            "INSERT INTO posts(raw_text, source_type, content_signature) VALUES (?, 'clipboard', ?)",
-            (text, signature),
-        )
-        conn.commit()
-        print(f"已写入 posts#{cur.lastrowid}")
-    rebuild_knowledge_index()
-
-
-def print_knowledge_history(title: str) -> None:
-    with closing(open_knowledge_db(create=True)) as conn:
-        rows = conn.execute("SELECT id, title, host_name, variant, created_at FROM scripts WHERE title LIKE ? ORDER BY created_at DESC LIMIT 20", (f"%{title}%",)).fetchall()
-        if not rows:
-            print(f"未找到剧本: {title}")
-            return
-        for row in rows:
-            print(f"script#{row['id']} {row['title']} host={row['host_name'] or '-'} variant={row['variant'] or '-'}")
-            for fact in conn.execute("SELECT key, value, raw_line FROM facts WHERE script_id=? ORDER BY last_seen_at DESC LIMIT 8", (row["id"],)):
-                print(f"  fact: {fact['key']} = {fact['value']}")
-
-
-def set_character_gender(script_title: str, character_name: str, gender: str) -> bool:
-    if gender not in {"男", "女"}:
-        return False
-    with closing(open_knowledge_db(create=True)) as conn:
-        script = conn.execute("SELECT id FROM scripts WHERE title LIKE ? ORDER BY created_at DESC LIMIT 1", (f"%{script_title}%",)).fetchone()
-        if not script:
-            return False
-        script_id = script["id"]
-        changed = 0
-        if db_table_exists(conn, "script_characters"):
-            cur = conn.execute(
-                "UPDATE script_characters SET gender_tag=?, last_seen_at=strftime('%s','now') WHERE script_id=? AND character_name LIKE ?",
-                (gender, script_id, f"%{character_name}%"),
-            )
-            changed += cur.rowcount
-        if db_table_exists(conn, "script_roles"):
-            cur = conn.execute(
-                "UPDATE script_roles SET gender_tag=?, last_seen_at=strftime('%s','now') WHERE script_id=? AND canonical_name LIKE ?",
-                (gender, script_id, f"%{character_name}%"),
-            )
-            changed += cur.rowcount
-        conn.commit()
-        return changed > 0
-
-
 def image_to_data_url(image: Any, max_side: int = 1280, quality: int = 78) -> str:
     from io import BytesIO
 
@@ -2776,10 +2060,9 @@ def print_usage() -> None:
   python easy_money_win.py comment-fixed-send-locate
   python easy_money_win.py post-image-locate
   python easy_money_win.py post-image-x-locate
-  python easy_money_win.py comment [--text 文本] [--solve-question|--doubao|--LLM [--vision]] [--noLocal] [--store 商家] --user <用户名前缀> [--debug]
+  python easy_money_win.py comment [--text 文本] [--solve-question|--doubao|--LLM [--vision]] --user <用户名前缀> [--debug]
   python easy_money_win.py llm ask "<问题>" [上下文]
   python easy_money_win.py doubao ask "<朋友圈正文>"
-  python easy_money_win.py kb stats|search|ask|parse|rebuild|learn|history|set-gender ...
 """
     )
 
@@ -3148,17 +2431,12 @@ def parse_comment_options(args: list[str]) -> CommentOptions:
         elif arg in {"--solve-question", "--slove-question"}:
             options.solve_question = True
         elif arg == "--doubao":
-            options.use_doubao = True
             options.solve_question = True
         elif arg == "--LLM":
             options.use_llm = True
             options.solve_question = True
         elif arg == "--vision":
             options.use_vision = True
-        elif arg == "--noLocal":
-            options.no_local = True
-        elif arg == "--store":
-            options.preferred_store, i = parse_option_value(args, i, "--store")
         elif arg == "--debug":
             options.debug = True
         elif arg == "--save-post-image":
@@ -3194,6 +2472,8 @@ def parse_comment_options(args: list[str]) -> CommentOptions:
             options.open_comment_mode = options.open_comment_mode.strip().lower()
         elif arg in {"--ocr-comment", "--fast", "--stream-capture", "--yolo-debug", "--save-yolo-images"}:
             print(f"提示: Windows v1 暂不完整支持 {arg}，已忽略或降级")
+        else:
+            raise EasyMoneyError(f"未知 comment 参数: {arg}")
         i += 1
 
     if not user_filter:
@@ -3361,21 +2641,14 @@ def resolve_comment_text(options: CommentOptions, post: MomentPostResolution, wi
     context = post.text.strip()
     if not context:
         raise EasyMoneyError("需要自动答题但未能读取朋友圈正文")
-    solved: Optional[SolvedQuestion] = None
-    if not options.no_local and not options.use_llm:
-        solved = solve_question_from_context(context, preferred_store=options.preferred_store, context=context)
+    image_urls: list[str] = []
+    if options.use_vision:
+        image_urls = capture_yolo_image_data_urls(post, window_rect)
+        print(f"已附带 YOLO 图片: {len(image_urls)} 张")
+    solved = ask_doubao_to_solve_post(context, image_data_urls=image_urls)
     if solved:
         final_text = solved.answer
-        print(f"本地知识库命中: {solved.answer} (source={solved.source}, confidence={solved.confidence:.2f})")
-    elif options.use_doubao or options.use_llm:
-        image_urls: list[str] = []
-        if options.use_vision:
-            image_urls = capture_yolo_image_data_urls(post, window_rect)
-            print(f"已附带 YOLO 图片: {len(image_urls)} 张")
-        solved = ask_doubao_to_solve_post(context, image_data_urls=image_urls)
-        if solved:
-            final_text = solved.answer
-            print(f"LLM 命中: {solved.answer}")
+        print(f"LLM 命中: {solved.answer}")
     if not final_text and options.comment_text:
         final_text = options.comment_text.strip()
         print("自动答题未命中，回退到 --text")
@@ -3566,84 +2839,6 @@ def cmd_doubao(args: list[str]) -> int:
     return 0
 
 
-def cmd_kb(args: list[str]) -> int:
-    if not args:
-        raise EasyMoneyError("用法: kb <stats|search|ask|parse|rebuild|learn|history|set-gender> ...")
-    sub = args[0]
-    if sub == "stats":
-        print_knowledge_stats()
-        return 0
-    if sub == "search":
-        if len(args) < 2:
-            raise EasyMoneyError('用法: kb search "<关键词>"')
-        search_knowledge(" ".join(args[1:]))
-        return 0
-    if sub == "ask":
-        question_parts: list[str] = []
-        store: Optional[str] = None
-        i = 1
-        while i < len(args):
-            if args[i] == "--store":
-                store, i = parse_option_value(args, i, "--store")
-            else:
-                question_parts.append(args[i])
-            i += 1
-        question = " ".join(question_parts).strip()
-        if not question:
-            raise EasyMoneyError('用法: kb ask "<问题>" [--store 商家名]')
-        started = time.perf_counter()
-        solved = solve_question_from_context(question, preferred_store=store)
-        elapsed = (time.perf_counter() - started) * 1000
-        if solved:
-            print(f"答案: {solved.answer}")
-            if solved.evidence:
-                print(f"证据: {solved.evidence}")
-            print(f"置信度: {solved.confidence:.2f}")
-            print(f"总耗时: {elapsed:.1f}ms")
-            return 0
-        print(f"总耗时: {elapsed:.1f}ms")
-        print("未能回答")
-        return 1
-    if sub == "parse":
-        question_parts = []
-        store = None
-        i = 1
-        while i < len(args):
-            if args[i] == "--store":
-                store, i = parse_option_value(args, i, "--store")
-            else:
-                question_parts.append(args[i])
-            i += 1
-        question = " ".join(question_parts).strip()
-        if not question:
-            raise EasyMoneyError('用法: kb parse "<问题>" [--store 商家名]')
-        print_parsed_question(question, store)
-        return 0
-    if sub == "rebuild":
-        rebuild_knowledge_index()
-        return 0
-    if sub == "learn":
-        learn_knowledge_from_clipboard()
-        return 0
-    if sub == "history":
-        if len(args) < 2:
-            raise EasyMoneyError('用法: kb history "<剧本名>"')
-        print_knowledge_history(" ".join(args[1:]))
-        return 0
-    if sub == "set-gender":
-        if len(args) < 4:
-            raise EasyMoneyError('用法: kb set-gender "<剧本名>" "<角色名>" "<男|女>"')
-        if set_character_gender(args[1], args[2], args[3]):
-            print(f"已更新角色性别: {args[1]} / {args[2]} -> {args[3]}")
-            rebuild_knowledge_index()
-            return 0
-        print("更新失败：请确认剧本名、角色名存在，且性别为 男 或 女")
-        return 1
-    if sub in {"audit", "self-test", "regression", "post-regression", "post-ask"}:
-        raise EasyMoneyError(f"Windows v1 暂未迁移 kb {sub}，请使用 stats/search/ask/parse/rebuild/learn/history/set-gender")
-    raise EasyMoneyError(f"未知 kb 子命令: {sub}")
-
-
 def main(argv: Optional[list[str]] = None) -> int:
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
@@ -3673,7 +2868,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         "comment": cmd_comment,
         "llm": cmd_llm,
         "doubao": cmd_doubao,
-        "kb": cmd_kb,
     }
     handler = dispatch.get(mode)
     if handler is None:

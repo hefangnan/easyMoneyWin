@@ -512,6 +512,11 @@ class InputBackend:
         self._mouse_click_cache[clicks] = cached
         return cached
 
+    def prepare_mouse_click(self, clicks: int = 1) -> None:
+        if clicks <= 0 or not (self.native and self.user32 is not None):
+            return
+        self._mouse_click_input_events(clicks)
+
     def _get_virtual_screen_metrics(self) -> tuple[int, int, int, int]:
         if self._virtual_screen_metrics is not None:
             return self._virtual_screen_metrics
@@ -2712,6 +2717,9 @@ def execute_comment_send_plan(plan: CommentSendPlan, input_backend: InputBackend
         input_backend.prepare_key_sequence(plan.open_comment_keys)
     if plan.submit_mode == "keys":
         input_backend.prepare_key_sequence(plan.submit_comment_keys)
+    prepare_mouse_click = getattr(input_backend, "prepare_mouse_click", None)
+    if callable(prepare_mouse_click):
+        prepare_mouse_click(1)
 
     send_flow_start = time.perf_counter()
     step_start = time.perf_counter()

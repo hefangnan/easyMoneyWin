@@ -4,6 +4,7 @@ import math
 
 from easy_money_win_core import *
 from easy_money_win_capture import CaptureBackend
+from easy_money_win_input import InputBackend
 
 def load_easy_money_dotenv() -> dict[str, str]:
     values: dict[str, str] = {}
@@ -515,7 +516,58 @@ def stitch_inline_images(images: list[Any], image_count: int) -> Any | None:
             stitched.paste(image, (column_index * tile_width, row_index * tile_height))
     return stitched
 
+def ctrl_left_click(point: Point) -> None:
+    """模拟 Ctrl+鼠标左键单击（用于点击朋友圈图片触发预览等操作）"""
+    input_backend = InputBackend()
+    if input_backend.native and input_backend.user32 is not None:
+        ctrl_vk = InputBackend._vk("ctrl")
+        input_backend.user32.keybd_event(ctrl_vk, 0, 0, 0)
+        time.sleep(0.02)
+        input_backend.click(point)
+        time.sleep(0.02)
+        input_backend.user32.keybd_event(ctrl_vk, 0, 0x0002, 0)
+    else:
+        import pyautogui
+        pyautogui.keyDown("ctrl")
+        input_backend.click(point)
+        pyautogui.keyUp("ctrl")
 
+
+def save_one_picture(post: MomentPostResolution, window_rect: Rect) -> Any:
+    """图片数量为 1 时，Ctrl+左键单击预览图片，截图"图片和视频"窗口（去掉顶部40px），返回 PIL Image 或 None"""
+    target_point = Point(post.body_frame.left + 100, post.action_point.y - 70)
+    print(target_point.x, target_point.y)
+    ctrl_left_click(target_point)
+    # 查找微信"图片和视频"窗口（带重试等待窗口出现）
+    import ctypes
+    user32 = ctypes.windll.user32
+    hwnd = None
+    for _ in range(10):
+        time.sleep(0.15)
+        hwnd = user32.FindWindowW(None, "图片和视频")
+        if hwnd:
+            break
+    if not hwnd:
+        print_ts(f"  '图片和视频' 窗口未找到")
+        return None
+    rect_struct = ctypes.wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(rect_struct))
+    pic_rect = Rect(rect_struct.left, rect_struct.top, rect_struct.right, rect_struct.bottom)
+    print_ts(f"  '图片和视频' 窗口找到 (HWND={hwnd:#x})")
+    print_ts(f"    位置: ({pic_rect.left}, {pic_rect.top}) - ({pic_rect.right}, {pic_rect.bottom})")
+    print_ts(f"    尺寸: {pic_rect.width}x{pic_rect.height}")
+    # 切换到"图片和视频"窗口
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(0.3)
+    # 截图窗口区域，去掉顶部 40px 的标题栏/工具栏
+    crop_rect = Rect(pic_rect.left, pic_rect.top + 40, pic_rect.right, pic_rect.bottom)
+    capture = CaptureBackend()
+    try:
+        image = capture.screenshot(crop_rect)
+    finally:
+        capture.close()
+    print_ts(f"  窗口截图成功: {image.width}x{image.height}（已裁切顶部40px）")
+    return image
 def capture_vision_image_data_urls(
     post: MomentPostResolution,
     window_rect: Rect,
@@ -531,6 +583,11 @@ def capture_vision_image_data_urls(
             raise EasyMoneyError("--LLM --vision UIA裁剪图拼接失败")
         image = stitched
         print_ts(f"  UIA裁剪图已去除4px间隔并拼接: {image.width}x{image.height}")
+    elif image_count is not None and image_count == 1:
+        image = save_one_picture(post, window_rect)
+        if image is None:
+            print_ts("  截图窗口失败，回退截取整条动态")
+            image = capture_post_image(post, window_rect)
     else:
         if image_count is None:
             print_ts("  UIA未检测到图片数量，使用整条动态区域截图")

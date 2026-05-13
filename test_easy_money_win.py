@@ -254,13 +254,34 @@ class EasyMoneyWinTests(unittest.TestCase):
             em.InputBackend = old_input_backend
             em.refresh_point_from_saved_offset = old_refresh_point
 
-    def test_comment_sends_with_tab_shortcut_after_typing(self):
+    def test_parse_comment_options_collects_comment_modes(self):
+        options = em.parse_comment_options([
+            "--text",
+            "好看",
+            "--user",
+            "fn",
+            "--open-click",
+            "--submit-enter",
+            "--rounds",
+            "2",
+        ])
+
+        self.assertEqual(options.comment_text, "好看")
+        self.assertEqual(options.requested_user, "fn")
+        self.assertEqual(options.open_comment_mode, "click")
+        self.assertEqual(options.submit_mode, "keys")
+        self.assertEqual(options.submit_comment_keys_override, ("enter",))
+        self.assertEqual(options.rounds, 2)
+
+    def test_comment_sends_with_default_click_after_typing(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_comment_config = em.CONFIG_COMMENT
             old_window_backend = em.WindowBackend
             old_input_backend = em.InputBackend
             old_refresh_point = em.refresh_point_from_saved_offset
             old_resolve_second = em.resolve_second_uia_list_item_post
+            old_open_mode = os.environ.pop("EASYMONEY_OPEN_COMMENT_MODE", None)
+            old_submit_mode = os.environ.pop("EASYMONEY_SUBMIT_MODE", None)
             events: list[tuple[str, object]] = []
             window_backends: list[object] = []
 
@@ -326,14 +347,17 @@ class EasyMoneyWinTests(unittest.TestCase):
                     em.cmd_comment(["--text", "1", "--user", "fn", "--rounds", "1"])
 
                 self.assertEqual(events[-6:], [
+                    ("activate", None),
                     ("prepare_key_sequence", ("tab", "enter")),
-                    ("prepare_key_sequence", ("tab", "tab", "tab", "enter")),
                     ("click", (300, 160, 1)),
                     ("press_sequence_atomic", ("tab", "enter")),
                     ("type", "1"),
-                    ("press_sequence_atomic", ("tab", "tab", "tab", "enter")),
+                    ("click", (267, 259, 1)),
                 ])
-                self.assertEqual([event for event in events if event[0] == "click"], [("click", (300, 160, 1))])
+                self.assertEqual([event for event in events if event[0] == "click"], [
+                    ("click", (300, 160, 1)),
+                    ("click", (267, 259, 1)),
+                ])
                 self.assertEqual(window_backends[0].moments_window_calls, 1)
             finally:
                 em.CONFIG_COMMENT = old_comment_config
@@ -341,6 +365,14 @@ class EasyMoneyWinTests(unittest.TestCase):
                 em.InputBackend = old_input_backend
                 em.refresh_point_from_saved_offset = old_refresh_point
                 em.resolve_second_uia_list_item_post = old_resolve_second
+                if old_open_mode is None:
+                    os.environ.pop("EASYMONEY_OPEN_COMMENT_MODE", None)
+                else:
+                    os.environ["EASYMONEY_OPEN_COMMENT_MODE"] = old_open_mode
+                if old_submit_mode is None:
+                    os.environ.pop("EASYMONEY_SUBMIT_MODE", None)
+                else:
+                    os.environ["EASYMONEY_SUBMIT_MODE"] = old_submit_mode
 
     def test_capture_backend_falls_back_to_mss_for_dxgi_invalid_region(self):
         backend = object.__new__(em.CaptureBackend)

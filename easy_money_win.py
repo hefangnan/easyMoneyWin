@@ -221,6 +221,53 @@ class UIAListItemResolution:
     elapsed_ms: int
 
 
+@dataclass
+class CommentOptions:
+    comment_text: Optional[str] = None
+    requested_user: str = ""
+    solve_question: bool = False
+    use_doubao: bool = False
+    use_llm: bool = False
+    use_vision: bool = False
+    no_local: bool = False
+    preferred_store: Optional[str] = None
+    debug: bool = False
+    save_post_image: bool = False
+    save_path: Optional[Path] = None
+    click_post_image: bool = False
+    test_image_crop: bool = False
+    rounds: int = 30
+    submit_comment_keys_override: Optional[tuple[str, ...]] = None
+    open_comment_mode: str = "keys"
+    submit_mode: str = "click"
+
+
+@dataclass
+class CommentSendPlan:
+    text: str
+    action_point: Point
+    comment_point: Point
+    send_point: Point
+    send_point_method: str
+    open_comment_mode: str
+    submit_mode: str
+    open_comment_keys: tuple[str, ...]
+    submit_comment_keys: tuple[str, ...]
+    comment_open_method: str
+    submit_method: str
+
+
+@dataclass
+class CommentSendResult:
+    text_input_method: str
+    action_click_ms: int
+    open_comment_ms: int
+    text_input_ms: int
+    send_submit_ms: int
+    total_send_ms: int
+    send_step_label: str
+
+
 HOME = Path.home()
 EASYMONEY_DIR = HOME / ".easyMoney"
 CONFIG_REFRESH = HOME / ".wechat_refresh_offset"
@@ -2685,7 +2732,10 @@ def image_to_data_url(image: Any, max_side: int = 1280, quality: int = 78) -> st
 def capture_post_image(post: MomentPostResolution, window_rect: Rect) -> Any:
     capture = CaptureBackend()
     region = post.body_frame.expanded(12, 24).clamp_to(window_rect)
-    return capture.screenshot(region)
+    try:
+        return capture.screenshot(region)
+    finally:
+        capture.close()
 
 
 def capture_yolo_image_data_urls(post: MomentPostResolution, window_rect: Rect) -> list[str]:
@@ -3077,190 +3127,193 @@ def cmd_post_image_locate(args: list[str], x_only: bool = False) -> int:
     return 0
 
 
-def cmd_comment(args: list[str]) -> int:
-    comment_text: Optional[str] = None
+def parse_comment_options(args: list[str]) -> CommentOptions:
+    options = CommentOptions(
+        open_comment_mode=(os.environ.get("EASYMONEY_OPEN_COMMENT_MODE") or "keys").strip().lower(),
+        submit_mode=(os.environ.get("EASYMONEY_SUBMIT_MODE") or "click").strip().lower(),
+    )
     user_filter = False
     user_name: Optional[str] = None
-    solve_question = False
-    use_doubao = False
-    use_llm = False
-    use_vision = False
-    no_local = False
-    preferred_store: Optional[str] = None
-    debug = False
-    save_post_image = False
-    save_path: Optional[Path] = None
-    click_post_image = False
-    test_image_crop = False
-    rounds = 30
-    submit_comment_keys_override: Optional[tuple[str, ...]] = None
-    open_comment_mode = (os.environ.get("EASYMONEY_OPEN_COMMENT_MODE") or "keys").strip().lower()
-    submit_mode = (os.environ.get("EASYMONEY_SUBMIT_MODE") or "click").strip().lower()
 
     i = 0
     while i < len(args):
         arg = args[i]
         if arg == "--text":
-            comment_text, i = parse_option_value(args, i, "--text")
+            options.comment_text, i = parse_option_value(args, i, "--text")
         elif arg == "--user":
             user_filter = True
             if i + 1 < len(args) and not args[i + 1].startswith("--"):
                 user_name = args[i + 1]
                 i += 1
         elif arg in {"--solve-question", "--slove-question"}:
-            solve_question = True
+            options.solve_question = True
         elif arg == "--doubao":
-            use_doubao = True
-            solve_question = True
+            options.use_doubao = True
+            options.solve_question = True
         elif arg == "--LLM":
-            use_llm = True
-            solve_question = True
+            options.use_llm = True
+            options.solve_question = True
         elif arg == "--vision":
-            use_vision = True
+            options.use_vision = True
         elif arg == "--noLocal":
-            no_local = True
+            options.no_local = True
         elif arg == "--store":
-            preferred_store, i = parse_option_value(args, i, "--store")
+            options.preferred_store, i = parse_option_value(args, i, "--store")
         elif arg == "--debug":
-            debug = True
+            options.debug = True
         elif arg == "--save-post-image":
-            save_post_image = True
+            options.save_post_image = True
         elif arg == "--output":
             value, i = parse_option_value(args, i, "--output")
-            save_path = expand_path(value)
+            options.save_path = expand_path(value)
         elif arg == "--click-post-image":
-            click_post_image = True
+            options.click_post_image = True
         elif arg in {"--test-image-crop", "--debug-image-crop"}:
-            test_image_crop = True
+            options.test_image_crop = True
         elif arg == "--rounds":
             value, i = parse_option_value(args, i, "--rounds")
-            rounds = max(1, int(value))
+            options.rounds = max(1, int(value))
         elif arg == "--submit-keys":
             value, i = parse_option_value(args, i, "--submit-keys")
-            submit_comment_keys_override = parse_key_sequence_text(value, "--submit-keys")
-            submit_mode = "keys"
+            options.submit_comment_keys_override = parse_key_sequence_text(value, "--submit-keys")
+            options.submit_mode = "keys"
         elif arg == "--submit-enter":
-            submit_comment_keys_override = ("enter",)
-            submit_mode = "keys"
+            options.submit_comment_keys_override = ("enter",)
+            options.submit_mode = "keys"
         elif arg == "--submit-click":
-            submit_mode = "click"
+            options.submit_mode = "click"
         elif arg == "--submit-mode":
-            submit_mode, i = parse_option_value(args, i, "--submit-mode")
-            submit_mode = submit_mode.strip().lower()
+            options.submit_mode, i = parse_option_value(args, i, "--submit-mode")
+            options.submit_mode = options.submit_mode.strip().lower()
         elif arg == "--open-click":
-            open_comment_mode = "click"
+            options.open_comment_mode = "click"
         elif arg == "--open-keys":
-            open_comment_mode = "keys"
+            options.open_comment_mode = "keys"
         elif arg == "--open-mode":
-            open_comment_mode, i = parse_option_value(args, i, "--open-mode")
-            open_comment_mode = open_comment_mode.strip().lower()
+            options.open_comment_mode, i = parse_option_value(args, i, "--open-mode")
+            options.open_comment_mode = options.open_comment_mode.strip().lower()
         elif arg in {"--ocr-comment", "--fast", "--stream-capture", "--yolo-debug", "--save-yolo-images"}:
             print(f"提示: Windows v1 暂不完整支持 {arg}，已忽略或降级")
         i += 1
 
     if not user_filter:
         raise EasyMoneyError("comment 命令必须显式指定 --user <用户名前缀>")
-    if use_vision and not use_llm:
+    if options.use_vision and not options.use_llm:
         raise EasyMoneyError("--vision 需要与 --LLM 一起使用")
-    if not any([comment_text, solve_question, save_post_image, click_post_image, test_image_crop]):
+    if not any([options.comment_text, options.solve_question, options.save_post_image, options.click_post_image, options.test_image_crop]):
         raise EasyMoneyError('请指定 --text "评论内容"，或使用 --solve-question / --doubao / --LLM / --save-post-image')
 
-    config = load_comment_config()
-    if not config and not any([save_post_image, click_post_image, test_image_crop]):
-        raise EasyMoneyError("未找到评论配置，请先运行 comment-locate")
-
-    requested_user = (user_name or "").strip()
-    if not requested_user:
+    options.requested_user = (user_name or "").strip()
+    if not options.requested_user:
         raise EasyMoneyError("comment --user 需要提供用户名前缀，用于匹配朋友圈第 2 个 ListItem 的开头")
+    return options
 
-    backend = WindowBackend()
-    input_backend = InputBackend()
-    win = backend.moments_window()
-    backend.activate(win)
-    window_rect = backend.rect(win)
-    if window_rect is None:
-        raise WindowPositionUnavailable("无法读取朋友圈窗口位置")
 
+def comment_requires_config(options: CommentOptions) -> bool:
+    return not any([options.save_post_image, options.click_post_image, options.test_image_crop])
+
+
+def normalize_comment_mode(mode: str, option_name: str) -> str:
+    normalized = mode.strip().lower()
+    if normalized in {"mouse", "coordinate"}:
+        return "click"
+    if normalized == "keyboard":
+        return "keys"
+    if normalized not in {"keys", "click"}:
+        raise EasyMoneyError(f"{option_name} 只支持 keys 或 click")
+    return normalized
+
+
+def resolve_comment_target_post(
+    backend: WindowBackend,
+    input_backend: InputBackend,
+    win: Any,
+    requested_user: str,
+    window_rect: Rect,
+    rounds: int,
+) -> tuple[MomentPostResolution, Rect]:
     post: Optional[MomentPostResolution] = None
     last_error: Optional[Exception] = None
     refresh_offset = load_point(CONFIG_REFRESH)
-    refresh_button_center = (
-        Point(window_rect.left + refresh_offset.x, window_rect.top + refresh_offset.y)
-        if refresh_offset is not None
-        else None
-    )
     refresh_capture: Optional[CaptureBackend] = None
-    for round_index in range(1, rounds + 1):
-        try:
-            print(f"[{current_timestamp_ms()}] UIA用户匹配: 第 {round_index}/{rounds} 轮")
-            current_window_rect = backend.rect(win)
-            if current_window_rect is None:
-                raise WindowPositionUnavailable("无法读取朋友圈窗口位置")
-            window_rect = current_window_rect
-            list_item = resolve_second_uia_list_item_post(
-                backend,
-                win,
-                requested_user,
-                item_index=1,
-                settle_ms=int(os.environ.get("EASYMONEY_UIA_USER_SETTLE_MS", "220")),
-                include_text=True,
-            )
-            post = MomentPostResolution(
-                body_frame=list_item.body_frame,
-                action_point=list_item.action_point,
-                text=list_item.text,
-                source=(
-                    f"UIA:ListItem #{list_item.item_index + 1} "
-                    f"prefix={list_item.detected_prefix or '(空)'} total={list_item.elapsed_ms}ms"
-                ),
-            )
-            print(
-                "  UIA用户匹配成功: "
-                f"user={requested_user} "
-                f"item=#{list_item.item_index + 1} "
-                f"prefix={list_item.detected_prefix or '(空)'} "
-                f"frame={list_item.body_frame.describe()} "
-                f"耗时={list_item.elapsed_ms}ms"
-            )
-            break
-        except WindowPositionUnavailable:
-            raise
-        except Exception as exc:
-            last_error = exc
-            if round_index >= rounds:
-                print(f"  UIA用户匹配失败: {exc}")
-                break
-            if refresh_button_center is None:
-                raise EasyMoneyError("UIA用户匹配失败且未找到刷新按钮坐标配置，请先运行 locate") from exc
-            print(f"  UIA用户匹配失败，执行刷新后继续: {exc}")
-            refresh_region = refresh_observation_region(window_rect)
+    try:
+        for round_index in range(1, rounds + 1):
             try:
-                if refresh_capture is None:
-                    refresh_capture = CaptureBackend()
-                baseline_fingerprint = quick_capture_fingerprint(refresh_capture, refresh_region)
-            except EasyMoneyError:
-                baseline_fingerprint = None
-            input_backend.click(refresh_button_center)
-            try:
-                if refresh_capture is None:
-                    refresh_capture = CaptureBackend()
-                wait_changed = wait_for_region_refresh(refresh_capture, refresh_region, baseline_fingerprint)
-            except EasyMoneyError:
-                wait_changed = False
-                time.sleep(COMMENT_REFRESH_WAIT_SECONDS)
-            print(
-                f"  已点击 locate 保存的刷新坐标: ({int(refresh_button_center.x)}, {int(refresh_button_center.y)})，"
-                f"{'检测到刷新变化' if wait_changed else f'等待 {int(COMMENT_REFRESH_WAIT_SECONDS * 1000)}ms'}"
-            )
-    if refresh_capture is not None:
-        refresh_capture.close()
-    if post is None:
-        raise EasyMoneyError(f"{last_error or 'UIA用户匹配失败'}；已尝试 {rounds} 轮，可用 --rounds N 调整")
+                print(f"[{current_timestamp_ms()}] UIA用户匹配: 第 {round_index}/{rounds} 轮")
+                current_window_rect = backend.rect(win)
+                if current_window_rect is None:
+                    raise WindowPositionUnavailable("无法读取朋友圈窗口位置")
+                window_rect = current_window_rect
+                list_item = resolve_second_uia_list_item_post(
+                    backend,
+                    win,
+                    requested_user,
+                    item_index=1,
+                    settle_ms=int(os.environ.get("EASYMONEY_UIA_USER_SETTLE_MS", "220")),
+                    include_text=True,
+                )
+                post = MomentPostResolution(
+                    body_frame=list_item.body_frame,
+                    action_point=list_item.action_point,
+                    text=list_item.text,
+                    source=(
+                        f"UIA:ListItem #{list_item.item_index + 1} "
+                        f"prefix={list_item.detected_prefix or '(空)'} total={list_item.elapsed_ms}ms"
+                    ),
+                )
+                print(
+                    "  UIA用户匹配成功: "
+                    f"user={requested_user} "
+                    f"item=#{list_item.item_index + 1} "
+                    f"prefix={list_item.detected_prefix or '(空)'} "
+                    f"frame={list_item.body_frame.describe()} "
+                    f"耗时={list_item.elapsed_ms}ms"
+                )
+                return post, window_rect
+            except WindowPositionUnavailable:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if round_index >= rounds:
+                    print(f"  UIA用户匹配失败: {exc}")
+                    break
+                if refresh_offset is None:
+                    raise EasyMoneyError("UIA用户匹配失败且未找到刷新按钮坐标配置，请先运行 locate") from exc
+                print(f"  UIA用户匹配失败，执行刷新后继续: {exc}")
+                refresh_region = refresh_observation_region(window_rect)
+                try:
+                    if refresh_capture is None:
+                        refresh_capture = CaptureBackend()
+                    baseline_fingerprint = quick_capture_fingerprint(refresh_capture, refresh_region)
+                except EasyMoneyError:
+                    baseline_fingerprint = None
+                refresh_button_center = Point(window_rect.left + refresh_offset.x, window_rect.top + refresh_offset.y)
+                input_backend.click(refresh_button_center)
+                try:
+                    if refresh_capture is None:
+                        refresh_capture = CaptureBackend()
+                    wait_changed = wait_for_region_refresh(refresh_capture, refresh_region, baseline_fingerprint)
+                except EasyMoneyError:
+                    wait_changed = False
+                    time.sleep(COMMENT_REFRESH_WAIT_SECONDS)
+                print(
+                    f"  已点击 locate 保存的刷新坐标: ({int(refresh_button_center.x)}, {int(refresh_button_center.y)})，"
+                    f"{'检测到刷新变化' if wait_changed else f'等待 {int(COMMENT_REFRESH_WAIT_SECONDS * 1000)}ms'}"
+                )
+    finally:
+        if refresh_capture is not None:
+            refresh_capture.close()
 
+    raise EasyMoneyError(f"{last_error or 'UIA用户匹配失败'}；已尝试 {rounds} 轮，可用 --rounds N 调整")
+
+
+def refresh_comment_window_rect(backend: WindowBackend, win: Any, window_rect: Rect) -> Rect:
     time.sleep(float(os.environ.get("EASYMONEY_UIA_AFTER_CAPTURE_DELAY", "0.02")))
     fresh_rect = backend.rect(win)
-    if fresh_rect is not None:
-        window_rect = fresh_rect
+    return fresh_rect if fresh_rect is not None else window_rect
+
+
+def print_resolved_comment_post(requested_user: str, post: MomentPostResolution) -> None:
     print(f"已匹配用户: {requested_user}")
     print(f"动态定位: {post.source} frame={post.body_frame.describe()}")
     if post.text:
@@ -3268,73 +3321,83 @@ def cmd_comment(args: list[str]) -> int:
         print(post.text)
         print("正文内容结束")
 
-    if save_post_image or test_image_crop:
-        image = capture_post_image(post, window_rect)
-        output = save_path or DEBUG_DIR / f"wechat_post_image_{time.strftime('%Y%m%d_%H%M%S')}.png"
-        CaptureBackend().save(image, output)
-        print(f"动态图片/区域已保存: {output}")
-        return 0
-    if click_post_image:
-        tap_offset = load_point(CONFIG_POST_IMAGE_TAP_OFFSET)
-        tap_x = load_float(CONFIG_POST_IMAGE_TAP_X_OFFSET)
-        if tap_offset:
-            point = Point(window_rect.left + tap_offset.x, window_rect.top + tap_offset.y)
-        else:
-            x = window_rect.left + tap_x if tap_x is not None else post.body_frame.center.x
-            point = Point(x, post.body_frame.center.y)
-        if debug:
-            input_backend.move_to(point)
-            print(f"DEBUG: 鼠标已移动到图片点击点 ({int(point.x)}, {int(point.y)})")
-            return 0
-        input_backend.click(point)
-        print(f"已点击动态图片区域 ({int(point.x)}, {int(point.y)})")
-        return 0
 
-    final_text = (comment_text or "").strip()
-    image_urls: list[str] = []
-    if solve_question:
-        context = post.text.strip()
-        if not context:
-            raise EasyMoneyError("需要自动答题但未能读取朋友圈正文")
-        solved: Optional[SolvedQuestion] = None
-        if not no_local and not use_llm:
-            solved = solve_question_from_context(context, preferred_store=preferred_store, context=context)
+def save_comment_post_image(post: MomentPostResolution, window_rect: Rect, save_path: Optional[Path]) -> int:
+    image = capture_post_image(post, window_rect)
+    output = save_path or DEBUG_DIR / f"wechat_post_image_{time.strftime('%Y%m%d_%H%M%S')}.png"
+    ensure_parent(output)
+    image.save(output)
+    print(f"动态图片/区域已保存: {output}")
+    return 0
+
+
+def click_comment_post_image(
+    input_backend: InputBackend,
+    post: MomentPostResolution,
+    window_rect: Rect,
+    debug: bool = False,
+) -> int:
+    tap_offset = load_point(CONFIG_POST_IMAGE_TAP_OFFSET)
+    tap_x = load_float(CONFIG_POST_IMAGE_TAP_X_OFFSET)
+    if tap_offset:
+        point = Point(window_rect.left + tap_offset.x, window_rect.top + tap_offset.y)
+    else:
+        x = window_rect.left + tap_x if tap_x is not None else post.body_frame.center.x
+        point = Point(x, post.body_frame.center.y)
+    if debug:
+        input_backend.move_to(point)
+        print(f"DEBUG: 鼠标已移动到图片点击点 ({int(point.x)}, {int(point.y)})")
+        return 0
+    input_backend.click(point)
+    print(f"已点击动态图片区域 ({int(point.x)}, {int(point.y)})")
+    return 0
+
+
+def resolve_comment_text(options: CommentOptions, post: MomentPostResolution, window_rect: Rect) -> str:
+    final_text = (options.comment_text or "").strip()
+    if not options.solve_question:
+        return final_text
+
+    context = post.text.strip()
+    if not context:
+        raise EasyMoneyError("需要自动答题但未能读取朋友圈正文")
+    solved: Optional[SolvedQuestion] = None
+    if not options.no_local and not options.use_llm:
+        solved = solve_question_from_context(context, preferred_store=options.preferred_store, context=context)
+    if solved:
+        final_text = solved.answer
+        print(f"本地知识库命中: {solved.answer} (source={solved.source}, confidence={solved.confidence:.2f})")
+    elif options.use_doubao or options.use_llm:
+        image_urls: list[str] = []
+        if options.use_vision:
+            image_urls = capture_yolo_image_data_urls(post, window_rect)
+            print(f"已附带 YOLO 图片: {len(image_urls)} 张")
+        solved = ask_doubao_to_solve_post(context, image_data_urls=image_urls)
         if solved:
             final_text = solved.answer
-            print(f"本地知识库命中: {solved.answer} (source={solved.source}, confidence={solved.confidence:.2f})")
-        elif use_doubao or use_llm:
-            if use_vision:
-                image_urls = capture_yolo_image_data_urls(post, window_rect)
-                print(f"已附带 YOLO 图片: {len(image_urls)} 张")
-            solved = ask_doubao_to_solve_post(context, image_data_urls=image_urls)
-            if solved:
-                final_text = solved.answer
-                print(f"LLM 命中: {solved.answer}")
-        if not final_text and comment_text:
-            final_text = comment_text.strip()
-            print("自动答题未命中，回退到 --text")
-        if not final_text:
-            raise EasyMoneyError("未能生成评论内容，请补充 --text 作为回退")
+            print(f"LLM 命中: {solved.answer}")
+    if not final_text and options.comment_text:
+        final_text = options.comment_text.strip()
+        print("自动答题未命中，回退到 --text")
+    if not final_text:
+        raise EasyMoneyError("未能生成评论内容，请补充 --text 作为回退")
+    return final_text
 
-    if config is None:
-        raise EasyMoneyError("未找到评论配置，请先运行 comment-locate")
+
+def build_comment_send_plan(
+    options: CommentOptions,
+    post: MomentPostResolution,
+    window_rect: Rect,
+    config: CommentConfig,
+    final_text: str,
+) -> CommentSendPlan:
     open_comment_keys = parse_key_sequence_text(os.environ.get("EASYMONEY_OPEN_COMMENT_KEYS", "tab,enter"), "EASYMONEY_OPEN_COMMENT_KEYS")
-    submit_comment_keys = submit_comment_keys_override or parse_key_sequence_text(
+    submit_comment_keys = options.submit_comment_keys_override or parse_key_sequence_text(
         os.environ.get("EASYMONEY_SUBMIT_KEYS", "tab,tab,tab,enter"),
         "EASYMONEY_SUBMIT_KEYS",
     )
-    if open_comment_mode in {"mouse", "coordinate"}:
-        open_comment_mode = "click"
-    if open_comment_mode not in {"keys", "keyboard", "click"}:
-        raise EasyMoneyError("--open-mode 只支持 keys 或 click")
-    if open_comment_mode == "keyboard":
-        open_comment_mode = "keys"
-    if submit_mode in {"mouse", "coordinate"}:
-        submit_mode = "click"
-    if submit_mode not in {"keys", "keyboard", "click"}:
-        raise EasyMoneyError("--submit-mode 只支持 keys 或 click")
-    if submit_mode == "keyboard":
-        submit_mode = "keys"
+    open_comment_mode = normalize_comment_mode(options.open_comment_mode, "--open-mode")
+    submit_mode = normalize_comment_mode(options.submit_mode, "--submit-mode")
     comment_point = Point(
         post.action_point.x + config.comment_from_action.x,
         post.action_point.y + config.comment_from_action.y,
@@ -3346,67 +3409,136 @@ def cmd_comment(args: list[str]) -> int:
     )
     send_point, send_point_method = resolve_send_point(post.action_point, window_rect, config)
     submit_method = f"点击发送按钮[{send_point_method}]" if submit_mode == "click" else format_key_sequence(submit_comment_keys)
-    if debug:
-        input_backend.move_to(post.action_point)
-        print(f"DEBUG: 操作按钮点 ({int(post.action_point.x)}, {int(post.action_point.y)})")
-        print(f"DEBUG: 打开评论方式: {comment_open_method}")
-        print(f"DEBUG: 评论菜单点 ({int(comment_point.x)}, {int(comment_point.y)})")
-        print(f"DEBUG: 发送方式: {submit_method}")
-        print(f"DEBUG: 发送点参考 [{send_point_method}] ({int(send_point.x)}, {int(send_point.y)})")
-        print(f"DEBUG: 评论内容: {final_text}")
-        return 0
+    return CommentSendPlan(
+        text=final_text,
+        action_point=post.action_point,
+        comment_point=comment_point,
+        send_point=send_point,
+        send_point_method=send_point_method,
+        open_comment_mode=open_comment_mode,
+        submit_mode=submit_mode,
+        open_comment_keys=open_comment_keys,
+        submit_comment_keys=submit_comment_keys,
+        comment_open_method=comment_open_method,
+        submit_method=submit_method,
+    )
 
-    if open_comment_mode == "keys":
-        input_backend.prepare_key_sequence(open_comment_keys)
-    if submit_mode == "keys":
-        input_backend.prepare_key_sequence(submit_comment_keys)
+
+def print_comment_debug(plan: CommentSendPlan, input_backend: InputBackend) -> None:
+    input_backend.move_to(plan.action_point)
+    print(f"DEBUG: 操作按钮点 ({int(plan.action_point.x)}, {int(plan.action_point.y)})")
+    print(f"DEBUG: 打开评论方式: {plan.comment_open_method}")
+    print(f"DEBUG: 评论菜单点 ({int(plan.comment_point.x)}, {int(plan.comment_point.y)})")
+    print(f"DEBUG: 发送方式: {plan.submit_method}")
+    print(f"DEBUG: 发送点参考 [{plan.send_point_method}] ({int(plan.send_point.x)}, {int(plan.send_point.y)})")
+    print(f"DEBUG: 评论内容: {plan.text}")
+
+
+def execute_comment_send_plan(plan: CommentSendPlan, input_backend: InputBackend) -> CommentSendResult:
+    if plan.open_comment_mode == "keys":
+        input_backend.prepare_key_sequence(plan.open_comment_keys)
+    if plan.submit_mode == "keys":
+        input_backend.prepare_key_sequence(plan.submit_comment_keys)
 
     send_flow_start = time.perf_counter()
     step_start = time.perf_counter()
-    input_backend.click(post.action_point, interval=0.0)
+    input_backend.click(plan.action_point, interval=0.0)
     action_click_ms = int((time.perf_counter() - step_start) * 1000)
 
     step_start = time.perf_counter()
-    if open_comment_mode == "click":
+    if plan.open_comment_mode == "click":
         open_click_delay_ms = float(os.environ.get("EASYMONEY_OPEN_CLICK_DELAY_MS", "0"))
         if open_click_delay_ms > 0:
             precise_delay(open_click_delay_ms / 1000.0)
-        input_backend.click(comment_point, interval=0.0)
+        input_backend.click(plan.comment_point, interval=0.0)
     else:
-        input_backend.press_sequence_atomic(open_comment_keys)
+        input_backend.press_sequence_atomic(plan.open_comment_keys)
     open_comment_ms = int((time.perf_counter() - step_start) * 1000)
 
-    text_input_method = ""
-    send_step_label = "发送点击" if submit_mode == "click" else "发送快捷键"
     can_type_text_directly = getattr(input_backend, "can_type_text_directly", input_backend.can_type_directly)
     step_start = time.perf_counter()
-    if can_type_text_directly(final_text):
-        text_input_method = input_backend.type_text_directly(final_text)
+    if can_type_text_directly(plan.text):
+        text_input_method = input_backend.type_text_directly(plan.text)
     else:
         text_input_method = input_backend.paste_text(
-            final_text,
+            plan.text,
             restore_clipboard=False,
             before_paste_delay=0.0,
             after_paste_delay=0.012,
         )
     text_input_ms = int((time.perf_counter() - step_start) * 1000)
 
+    send_step_label = "发送点击" if plan.submit_mode == "click" else "发送快捷键"
     step_start = time.perf_counter()
-    if submit_mode == "click":
-        input_backend.click(send_point, interval=0.0)
+    if plan.submit_mode == "click":
+        input_backend.click(plan.send_point, interval=0.0)
     else:
-        input_backend.press_sequence_atomic(submit_comment_keys)
+        input_backend.press_sequence_atomic(plan.submit_comment_keys)
     send_submit_ms = int((time.perf_counter() - step_start) * 1000)
     total_send_ms = int((time.perf_counter() - send_flow_start) * 1000)
+    return CommentSendResult(
+        text_input_method=text_input_method,
+        action_click_ms=action_click_ms,
+        open_comment_ms=open_comment_ms,
+        text_input_ms=text_input_ms,
+        send_submit_ms=send_submit_ms,
+        total_send_ms=total_send_ms,
+        send_step_label=send_step_label,
+    )
+
+
+def print_comment_send_result(plan: CommentSendPlan, result: CommentSendResult) -> None:
     print(
-        f"已执行评论发送: {text_input_method} | 打开评论={comment_open_method} | "
-        f"发送方式={submit_method} | 发送点参考=({int(send_point.x)}, {int(send_point.y)})"
+        f"已执行评论发送: {result.text_input_method} | 打开评论={plan.comment_open_method} | "
+        f"发送方式={plan.submit_method} | 发送点参考=({int(plan.send_point.x)}, {int(plan.send_point.y)})"
     )
     print(
-        f"发送流程耗时: 总计={total_send_ms}ms | "
-        f"点操作={action_click_ms}ms | 打开评论={open_comment_ms}ms | "
-        f"输入={text_input_ms}ms | {send_step_label}={send_submit_ms}ms"
+        f"发送流程耗时: 总计={result.total_send_ms}ms | "
+        f"点操作={result.action_click_ms}ms | 打开评论={result.open_comment_ms}ms | "
+        f"输入={result.text_input_ms}ms | {result.send_step_label}={result.send_submit_ms}ms"
     )
+
+
+def cmd_comment(args: list[str]) -> int:
+    options = parse_comment_options(args)
+    config = load_comment_config()
+    if not config and comment_requires_config(options):
+        raise EasyMoneyError("未找到评论配置，请先运行 comment-locate")
+
+    backend = WindowBackend()
+    input_backend = InputBackend()
+    win = backend.moments_window()
+    backend.activate(win)
+    window_rect = backend.rect(win)
+    if window_rect is None:
+        raise WindowPositionUnavailable("无法读取朋友圈窗口位置")
+
+    post, window_rect = resolve_comment_target_post(
+        backend,
+        input_backend,
+        win,
+        options.requested_user,
+        window_rect,
+        options.rounds,
+    )
+    window_rect = refresh_comment_window_rect(backend, win, window_rect)
+    print_resolved_comment_post(options.requested_user, post)
+
+    if options.save_post_image or options.test_image_crop:
+        return save_comment_post_image(post, window_rect, options.save_path)
+    if options.click_post_image:
+        return click_comment_post_image(input_backend, post, window_rect, debug=options.debug)
+
+    final_text = resolve_comment_text(options, post, window_rect)
+    if config is None:
+        raise EasyMoneyError("未找到评论配置，请先运行 comment-locate")
+    plan = build_comment_send_plan(options, post, window_rect, config, final_text)
+    if options.debug:
+        print_comment_debug(plan, input_backend)
+        return 0
+
+    result = execute_comment_send_plan(plan, input_backend)
+    print_comment_send_result(plan, result)
     return 0
 
 

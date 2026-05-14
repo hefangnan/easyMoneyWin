@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import concurrent.futures
+
 from easy_money_win_core import *
 from easy_money_win_input import *
 from easy_money_win_capture import *
@@ -462,6 +464,29 @@ def normalize_comment_mode(mode: str, option_name: str) -> str:
     return normalized
 
 
+def uia_worker_thread_enabled() -> bool:
+    value = os.environ.get("EASYMONEY_UIA_WORKER_THREAD", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _initialize_com_for_uia_worker() -> Callable[[], None]:
+    try:
+        comtypes = require_module("comtypes", "comtypes")
+        co_initialize = getattr(comtypes, "CoInitialize", None)
+        co_uninitialize = getattr(comtypes, "CoUninitialize", None)
+        if callable(co_initialize):
+            co_initialize()
+            if callable(co_uninitialize):
+                return co_uninitialize
+    except Exception:
+        pass
+    return lambda: None
+
+
+def _is_missing_sns_list_error(exc: Exception) -> bool:
+    return isinstance(exc, UIAListItemUnavailable) and "sns_list" in str(exc)
+
+
 def resolve_comment_target_post(
     backend: WindowBackend,
     input_backend: InputBackend,
@@ -469,87 +494,115 @@ def resolve_comment_target_post(
     requested_user: str,
     window_rect: Rect,
     rounds: int,
+    include_text: bool = True,
+    uia_mode: str = "当前线程",
 ) -> tuple[MomentPostResolution, Rect]:
     post: Optional[MomentPostResolution] = None
     last_error: Optional[Exception] = None
+    missing_sns_list_failures = 0
     refresh_offset = load_point(CONFIG_REFRESH)
-    refresh_capture: Optional[CaptureBackend] = None
-    try:
-        for round_index in range(1, rounds + 1):
-            try:
-                print(f"[{current_timestamp_ms()}] UIA用户匹配: 第 {round_index}/{rounds} 轮")
-                current_window_rect = backend.rect(win)
-                if current_window_rect is None:
-                    raise WindowPositionUnavailable("无法读取朋友圈窗口位置")
-                window_rect = current_window_rect
-                list_item = resolve_second_uia_list_item_post(
-                    backend,
-                    win,
-                    requested_user,
-                    item_index=1,
-                    settle_ms=int(os.environ.get("EASYMONEY_UIA_USER_SETTLE_MS", "220")),
-                    include_text=True,
-                )
-                post = MomentPostResolution(
-                    body_frame=list_item.body_frame,
-                    action_point=list_item.action_point,
-                    text=list_item.text,
-                    source=(
-                        f"UIA:ListItem #{list_item.item_index + 1} "
-                        f"prefix={list_item.detected_prefix or '(空)'} total={list_item.elapsed_ms}ms"
-                    ),
-                    inline_image_count=list_item.inline_image_count,
-                )
-                print(
-                    "  UIA用户匹配成功: "
-                    f"user={requested_user} "
-                    f"item=#{list_item.item_index + 1} "
-                    f"prefix={list_item.detected_prefix or '(空)'} "
-                    f"frame={list_item.body_frame.describe()} "
-                    f"耗时={list_item.elapsed_ms}ms"
-                )
-                return post, window_rect
-            except WindowPositionUnavailable:
-                raise
-            except Exception as exc:
-                last_error = exc
-                if round_index >= rounds:
-                    print(f"  UIA用户匹配失败: {exc}")
+    refresh_button_center = (
+        Point(window_rect.left + refresh_offset.x, window_rect.top + refresh_offset.y)
+        if refresh_offset is not None
+        else None
+    )
+    for round_index in range(1, rounds + 1):
+        try:
+            print(f"[{current_timestamp_ms()}] UIA用户匹配({uia_mode}): 第 {round_index}/{rounds} 轮")
+            list_item = resolve_second_uia_list_item_post(
+                backend,
+                win,
+                requested_user,
+                item_index=1,
+                settle_ms=int(os.environ.get("EASYMONEY_UIA_USER_SETTLE_MS", "220")),
+                include_text=include_text,
+            )
+            post = MomentPostResolution(
+                body_frame=list_item.body_frame,
+                action_point=list_item.action_point,
+                text=list_item.text,
+                source=(
+                    f"UIA:ListItem #{list_item.item_index + 1} "
+                    f"prefix={list_item.detected_prefix or '(空)'} total={list_item.elapsed_ms}ms thread={uia_mode}"
+                ),
+                inline_image_count=list_item.inline_image_count,
+            )
+            print(
+                f"  UIA用户匹配成功({uia_mode}): "
+                f"user={requested_user} "
+                f"item=#{list_item.item_index + 1} "
+                f"prefix={list_item.detected_prefix or '(空)'} "
+                f"frame={list_item.body_frame.describe()} "
+                f"耗时={list_item.elapsed_ms}ms"
+            )
+            return post, window_rect
+        except WindowPositionUnavailable:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if _is_missing_sns_list_error(exc):
+                missing_sns_list_failures += 1
+                missing_sns_list_limit = max(0, int(os.environ.get("EASYMONEY_UIA_MISSING_SNS_REFRESH_LIMIT", "3")))
+                if missing_sns_list_limit and missing_sns_list_failures >= missing_sns_list_limit:
+                    print(
+                        "  UIA连续未暴露 sns_list，停止刷新重试；"
+                        "请确认朋友圈窗口已打开且当前微信版本仍暴露 sns_list"
+                    )
                     break
-                if refresh_offset is None:
-                    raise EasyMoneyError("UIA用户匹配失败且未找到刷新按钮坐标配置，请先运行 locate") from exc
-                print(f"  UIA用户匹配失败，执行刷新后继续: {exc}")
-                refresh_region = refresh_observation_region(window_rect)
-                try:
-                    if refresh_capture is None:
-                        refresh_capture = CaptureBackend()
-                    baseline_fingerprint = quick_capture_fingerprint(refresh_capture, refresh_region)
-                except EasyMoneyError:
-                    baseline_fingerprint = None
-                refresh_button_center = Point(window_rect.left + refresh_offset.x, window_rect.top + refresh_offset.y)
-                input_backend.click(refresh_button_center)
-                try:
-                    if refresh_capture is None:
-                        refresh_capture = CaptureBackend()
-                    wait_changed = wait_for_region_refresh(refresh_capture, refresh_region, baseline_fingerprint)
-                except EasyMoneyError:
-                    wait_changed = False
-                    time.sleep(COMMENT_REFRESH_WAIT_SECONDS)
-                print(
-                    f"  已点击 locate 保存的刷新坐标: ({int(refresh_button_center.x)}, {int(refresh_button_center.y)})，"
-                    f"{'检测到刷新变化' if wait_changed else f'等待 {int(COMMENT_REFRESH_WAIT_SECONDS * 1000)}ms'}"
-                )
-    finally:
-        if refresh_capture is not None:
-            refresh_capture.close()
+            else:
+                missing_sns_list_failures = 0
+            if round_index >= rounds:
+                print(f"  UIA用户匹配失败({uia_mode}): {exc}")
+                break
+            if refresh_offset is None:
+                raise EasyMoneyError("UIA用户匹配失败且未找到刷新按钮坐标配置，请先运行 locate") from exc
+            print(f"  UIA用户匹配失败({uia_mode})，执行刷新后继续: {exc}")
+            if refresh_button_center is None:
+                raise EasyMoneyError("UIA用户匹配失败且未找到刷新按钮坐标配置，请先运行 locate") from exc
+            input_backend.click(refresh_button_center)
+            time.sleep(COMMENT_REFRESH_WAIT_SECONDS)
+            print(
+                f"  已点击 locate 保存的刷新坐标: ({int(refresh_button_center.x)}, {int(refresh_button_center.y)})，"
+                f"等待 {int(COMMENT_REFRESH_WAIT_SECONDS * 1000)}ms"
+            )
 
     raise EasyMoneyError(f"{last_error or 'UIA用户匹配失败'}；已尝试 {rounds} 轮，可用 --rounds N 调整")
 
 
-def refresh_comment_window_rect(backend: WindowBackend, win: Any, window_rect: Rect) -> Rect:
-    time.sleep(float(os.environ.get("EASYMONEY_UIA_AFTER_CAPTURE_DELAY", "0.02")))
-    fresh_rect = backend.rect(win)
-    return fresh_rect if fresh_rect is not None else window_rect
+def resolve_comment_target_post_worker_entry(
+    requested_user: str,
+    rounds: int,
+    include_text: bool,
+    uia_mode: str,
+) -> tuple[MomentPostResolution, Rect]:
+    uninitialize_com = _initialize_com_for_uia_worker()
+    try:
+        backend = WindowBackend()
+        input_backend = InputBackend()
+        win = backend.moments_window()
+        backend.activate(win)
+        window_rect = backend.rect(win)
+        if window_rect is None:
+            raise WindowPositionUnavailable("无法读取朋友圈窗口位置")
+        return resolve_comment_target_post(
+            backend,
+            input_backend,
+            win,
+            requested_user,
+            window_rect,
+            rounds,
+            include_text=include_text,
+            uia_mode=uia_mode,
+        )
+    finally:
+        uninitialize_com()
+
+
+def resolve_comment_target_post_via_worker(requested_user: str, rounds: int, include_text: bool = True) -> tuple[MomentPostResolution, Rect]:
+    if not uia_worker_thread_enabled():
+        return resolve_comment_target_post_worker_entry(requested_user, rounds, include_text, "主线程")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="easymoney-uia") as executor:
+        return executor.submit(resolve_comment_target_post_worker_entry, requested_user, rounds, include_text, "worker线程").result()
 
 
 def print_resolved_comment_post(requested_user: str, post: MomentPostResolution) -> None:
@@ -753,27 +806,16 @@ def cmd_comment(args: list[str]) -> int:
     if not config and comment_requires_config(options):
         raise EasyMoneyError("未找到评论配置，请先运行 comment-locate")
 
-    backend = WindowBackend()
-    input_backend = InputBackend()
-    win = backend.moments_window()
-    backend.activate(win)
-    window_rect = backend.rect(win)
-    if window_rect is None:
-        raise WindowPositionUnavailable("无法读取朋友圈窗口位置")
-
-    post, window_rect = resolve_comment_target_post(
-        backend,
-        input_backend,
-        win,
+    post, window_rect = resolve_comment_target_post_via_worker(
         options.requested_user,
-        window_rect,
         options.rounds,
+        include_text=options.solve_question,
     )
-    window_rect = refresh_comment_window_rect(backend, win, window_rect)
     print_resolved_comment_post(options.requested_user, post)
 
     if options.save_post_image or options.test_image_crop:
         return save_comment_post_image(post, window_rect, options.save_path)
+    input_backend = InputBackend()
     if options.click_post_image:
         return click_comment_post_image(input_backend, post, window_rect, debug=options.debug)
 

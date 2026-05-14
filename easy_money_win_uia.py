@@ -40,6 +40,7 @@ class WindowBackend:
         self._uia_module: Optional[Any] = None
         self._automation: Optional[Any] = None
         self._sns_list_cache: dict[Any, Any] = {}
+        self._list_item_strategy_cache: dict[Any, str] = {}
 
     @staticmethod
     def _safe_text(control: Any) -> str:
@@ -601,6 +602,18 @@ def dump_named_list_contents(
 def find_list_items_under_control(window_backend: WindowBackend, root: Any, max_depth: int = 3, limit: Optional[int] = None) -> list[Any]:
     items: list[Any] = []
     seen: set[Any] = set()
+    strategies = (
+        "listitem_children",
+        "children",
+        "iter_tree",
+        "descendants_listitem",
+        "descendants",
+    )
+    try:
+        cache_key = window_backend._control_identity(root)
+    except Exception:
+        cache_key = ("object", id(root))
+    strategy_cache = getattr(window_backend, "_list_item_strategy_cache", None)
 
     def add_if_list_item(node: Any) -> bool:
         marker = window_backend._control_identity(node)
@@ -612,46 +625,52 @@ def find_list_items_under_control(window_backend: WindowBackend, root: Any, max_
         items.append(node)
         return limit is not None and len(items) >= limit
 
-    for node in window_backend.listitem_children(root, limit=limit):
-        if add_if_list_item(node):
+    def strategy_nodes(strategy: str) -> Iterable[Any]:
+        if strategy == "listitem_children":
+            yield from window_backend.listitem_children(root, limit=limit)
+        elif strategy == "children":
+            yield from window_backend.children(root)
+        elif strategy == "iter_tree":
+            for node, depth in window_backend.iter_tree(root, max_depth=max_depth):
+                if depth != 0:
+                    yield node
+        elif strategy == "descendants_listitem":
+            try:
+                yield from root.descendants(control_type="ListItem")
+            except Exception:
+                return
+        elif strategy == "descendants":
+            try:
+                yield from root.descendants()
+            except Exception:
+                return
+
+    def scan_strategy(strategy: str) -> tuple[bool, bool]:
+        start_count = len(items)
+        for node in strategy_nodes(strategy):
+            if add_if_list_item(node):
+                return True, True
+        found = len(items) > start_count
+        complete = found and (limit is None or len(items) >= limit)
+        return found, complete
+
+    cached_strategy = strategy_cache.get(cache_key) if isinstance(strategy_cache, dict) else None
+    if cached_strategy in strategies:
+        found, complete = scan_strategy(cached_strategy)
+        if complete:
             return items
 
-    if items and (limit is None or len(items) >= limit):
-        return items
-
-    for node in window_backend.children(root):
-        if add_if_list_item(node):
-            return items
-
-    if items and (limit is None or len(items) >= limit):
-        return items
-
-    for node, depth in window_backend.iter_tree(root, max_depth=max_depth):
-        if depth == 0:
+    for strategy in strategies:
+        if strategy == cached_strategy:
             continue
-        if add_if_list_item(node):
+        found, complete = scan_strategy(strategy)
+        if found and isinstance(strategy_cache, dict):
+            strategy_cache[cache_key] = strategy
+        if complete:
             return items
 
-    if items and (limit is None or len(items) >= limit):
-        return items
-
-    try:
-        descendants = root.descendants(control_type="ListItem")
-    except Exception:
-        descendants = []
-    for node in descendants:
-        if add_if_list_item(node):
-            return items
-    if items:
-        return items
-
-    try:
-        descendants = root.descendants()
-    except Exception:
-        descendants = []
-    for node in descendants:
-        if add_if_list_item(node):
-            return items
+    if items and isinstance(strategy_cache, dict):
+        strategy_cache[cache_key] = cached_strategy if cached_strategy in strategies else strategies[0]
     return items
 
 

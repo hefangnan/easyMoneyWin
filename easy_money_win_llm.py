@@ -5,6 +5,10 @@ import math
 from easy_money_win_core import *
 from easy_money_win_capture import CaptureBackend
 from easy_money_win_input import InputBackend
+from easy_money_win_uia import WindowBackend
+
+
+SINGLE_IMAGE_FOCUS_KEYS = ("down", "tab", "tab", "tab")
 
 def load_easy_money_dotenv() -> dict[str, str]:
     values: dict[str, str] = {}
@@ -447,10 +451,7 @@ def inline_image_looks_loaded(image: Any) -> bool:
     return not (bright_low_chroma_ratio >= 0.92 and dark_or_colorful_ratio <= 0.05 and stddev <= 18)
 
 
-def capture_uia_inline_image_regions(post: MomentPostResolution, window_rect: Rect, image_count: int) -> list[Any]:
-    rects = direct_uia_inline_image_rects(post.body_frame, image_count, window_rect)
-    if not rects:
-        return []
+def inline_image_load_timeout_ms() -> int:
     timeout_ms = max(
         80,
         min(
@@ -458,13 +459,28 @@ def capture_uia_inline_image_regions(post: MomentPostResolution, window_rect: Re
             8000,
         ),
     )
-    interval_ms = max(
+    return timeout_ms
+
+
+def inline_image_load_interval_ms() -> int:
+    return max(
         0,
         min(
             int(first_non_empty_env(["EASYMONEY_AX_IMAGE_LOAD_INTERVAL_MS", "EASYMONEY_DOUBAO_AX_IMAGE_LOAD_INTERVAL_MS"]) or "0"),
             1000,
         ),
     )
+
+
+def rect_intersects(lhs: Rect, rhs: Rect) -> bool:
+    return lhs.left < rhs.right and lhs.right > rhs.left and lhs.top < rhs.bottom and lhs.bottom > rhs.top
+
+
+def crop_loaded_inline_image_regions(rects: list[Rect], window_rect: Rect, label: str) -> list[Any]:
+    if not rects:
+        return []
+    timeout_ms = inline_image_load_timeout_ms()
+    interval_ms = inline_image_load_interval_ms()
     deadline = time.perf_counter() + timeout_ms / 1000.0
     loaded: list[Any | None] = [None] * len(rects)
     attempts = 0
@@ -489,10 +505,70 @@ def capture_uia_inline_image_regions(post: MomentPostResolution, window_rect: Re
 
     images = [image for image in loaded if image is not None]
     if len(images) < len(rects):
-        print_ts(f"  UIA图片加载等待超时: 已加载{len(images)}/{len(rects)}，尝试{attempts}帧，等待{timeout_ms}ms")
+        print_ts(f"  {label}加载等待超时: 已加载{len(images)}/{len(rects)}，尝试{attempts}帧，等待{timeout_ms}ms")
     else:
-        print_ts(f"  UIA图片加载完成: {len(images)}/{len(rects)}，尝试{attempts}帧")
+        print_ts(f"  {label}加载完成: {len(images)}/{len(rects)}，尝试{attempts}帧")
     return images
+
+
+def capture_uia_inline_image_regions(post: MomentPostResolution, window_rect: Rect, image_count: int) -> list[Any]:
+    rects = direct_uia_inline_image_rects(post.body_frame, image_count, window_rect)
+    return crop_loaded_inline_image_regions(rects, window_rect, "UIA图片")
+
+
+def focused_element_description(backend: WindowBackend, element: Any, rect: Rect) -> str:
+    name = backend._safe_text(element).strip()
+    control_type = backend._control_type(element)
+    class_name = backend._class_name(element)
+    return f"type={control_type or '?'} name={name or '(空)'} class={class_name or '(空)'} rect={rect.describe()}"
+
+
+def focused_element_is_image_button(backend: WindowBackend, element: Any) -> bool:
+    name = backend._safe_text(element).strip()
+    control_type = backend._control_type(element).strip().lower()
+    class_name = backend._class_name(element)
+    is_button = control_type in {"button", "按钮"} or "button" in control_type
+    return is_button and (name == "图片" or class_name == "mmui::XMouseEventView")
+
+
+def locate_single_uia_inline_image_rect(post: MomentPostResolution, window_rect: Rect) -> Rect:
+    backend = WindowBackend()
+    input_backend = InputBackend()
+
+    input_backend.prepare_key_sequence(SINGLE_IMAGE_FOCUS_KEYS)
+    key_gap_ms = max(0, min(int(first_non_empty_env(["EASYMONEY_SINGLE_IMAGE_KEY_GAP_MS"]) or "30"), 1000))
+    input_backend.press_sequence(SINGLE_IMAGE_FOCUS_KEYS, gap=key_gap_ms / 1000.0)
+
+    focus_wait_ms = max(0, min(int(first_non_empty_env(["EASYMONEY_SINGLE_IMAGE_FOCUS_WAIT_MS"]) or "120"), 3000))
+    if focus_wait_ms > 0:
+        time.sleep(focus_wait_ms / 1000.0)
+
+    automation, _ = backend._ensure_automation()
+    focused = automation.GetFocusedElement()
+    if focused is None:
+        raise EasyMoneyError("单图键盘定位失败: 未读取到当前焦点元素")
+    focus_rect = backend.rect(focused)
+    if focus_rect is None:
+        raise EasyMoneyError("单图键盘定位失败: 当前焦点元素没有有效矩形")
+    if not focused_element_is_image_button(backend, focused):
+        raise EasyMoneyError(f"单图键盘定位失败: 当前焦点不是图片按钮 ({focused_element_description(backend, focused, focus_rect)})")
+    if not rect_intersects(focus_rect, post.body_frame):
+        raise EasyMoneyError(
+            "单图键盘定位失败: 当前焦点图片不在目标动态区域内 "
+            f"(focus={focus_rect.describe()} post={post.body_frame.describe()})"
+        )
+
+    crop_rect = focus_rect.clamp_to(window_rect)
+    if crop_rect.width <= 1 or crop_rect.height <= 1:
+        raise EasyMoneyError(f"单图键盘定位失败: 焦点截图区域无效 {crop_rect.describe()}")
+    print_ts(f"  单图键盘定位成功: {focused_element_description(backend, focused, crop_rect)}")
+    return crop_rect
+
+
+def capture_single_uia_inline_image_region(post: MomentPostResolution, window_rect: Rect) -> Any | None:
+    rect = locate_single_uia_inline_image_rect(post, window_rect)
+    images = crop_loaded_inline_image_regions([rect], window_rect, "UIA单图")
+    return images[0] if images else None
 
 
 def stitch_inline_images(images: list[Any], image_count: int) -> Any | None:
@@ -584,10 +660,9 @@ def capture_vision_image_data_urls(
         image = stitched
         print_ts(f"  UIA裁剪图已去除4px间隔并拼接: {image.width}x{image.height}")
     elif image_count is not None and image_count == 1:
-        image = save_one_picture(post, window_rect)
+        image = capture_single_uia_inline_image_region(post, window_rect)
         if image is None:
-            print_ts("  截图窗口失败，回退截取整条动态")
-            image = capture_post_image(post, window_rect)
+            raise EasyMoneyError("--LLM --vision UIA单图裁剪未加载完成")
     else:
         if image_count is None:
             print_ts("  UIA未检测到图片数量，使用整条动态区域截图")

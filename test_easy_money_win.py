@@ -138,6 +138,43 @@ class EasyMoneyWinTests(unittest.TestCase):
         items = em.find_list_items_under_control(FakeBackend(), object(), limit=1)
         self.assertEqual(len(items), 1)
 
+    def test_list_item_lookup_reuses_successful_strategy(self):
+        class FakeNode:
+            def __init__(self, kind: str) -> None:
+                self.kind = kind
+
+        root = object()
+
+        class FakeBackend:
+            def __init__(self) -> None:
+                self._list_item_strategy_cache: dict[object, str] = {}
+                self.calls: list[str] = []
+
+            def listitem_children(self, root: object, limit=None):
+                self.calls.append("listitem_children")
+                return []
+
+            def children(self, root: object):
+                self.calls.append("children")
+                return [FakeNode("listitem")]
+
+            def iter_tree(self, root: object, max_depth: int = 3):
+                raise AssertionError("tree traversal should not run after children succeeds")
+
+            def _control_identity(self, node: object):
+                return node if node is root else id(node)
+
+            def _control_type(self, node: FakeNode):
+                return node.kind
+
+        backend = FakeBackend()
+        self.assertEqual(len(em.find_list_items_under_control(backend, root, limit=1)), 1)
+        self.assertEqual(backend.calls, ["listitem_children", "children"])
+
+        backend.calls = []
+        self.assertEqual(len(em.find_list_items_under_control(backend, root, limit=1)), 1)
+        self.assertEqual(backend.calls, ["children"])
+
     def test_default_dump_uses_sns_list_fast_path(self):
         class FakeNode:
             def __init__(self, kind: str, name: str = "", automation_id: str = "") -> None:
@@ -190,46 +227,65 @@ class EasyMoneyWinTests(unittest.TestCase):
         self.assertEqual(item_count, 1)
         self.assertEqual(backend.item_limit, 2)
 
-    def test_comment_aborts_when_window_rect_unavailable_before_refresh(self):
-        old_window_backend = em_commands.WindowBackend
-        old_input_backend = em_commands.InputBackend
-        old_refresh_point = em_commands.refresh_point_from_saved_offset
-        clicks: list[em.Point] = []
+    def test_comment_uses_initial_window_rect_for_refresh_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_comment_config = em_core.CONFIG_COMMENT
+            old_refresh_config = em_core.CONFIG_REFRESH
+            old_commands_refresh_config = em_commands.CONFIG_REFRESH
+            old_window_backend = em_commands.WindowBackend
+            old_input_backend = em_commands.InputBackend
+            clicks: list[em.Point] = []
+            window_backends: list[object] = []
 
-        class FakeWindowBackend:
-            def __init__(self) -> None:
-                self.rect_calls = 0
+            class FakeWindowBackend:
+                def __init__(self) -> None:
+                    self.rect_calls = 0
+                    window_backends.append(self)
 
-            def moments_window(self) -> object:
-                return object()
+                def moments_window(self) -> object:
+                    return object()
 
-            def activate(self, win: object) -> None:
-                pass
+                def activate(self, win: object) -> None:
+                    pass
 
-            def rect(self, win: object) -> em.Rect | None:
-                self.rect_calls += 1
-                if self.rect_calls == 1:
-                    return em.Rect(0, 0, 400, 800)
-                return None
+                def rect(self, win: object) -> em.Rect | None:
+                    self.rect_calls += 1
+                    if self.rect_calls == 1:
+                        return em.Rect(100, 200, 500, 1000)
+                    return None
 
-        class FakeInputBackend:
-            def click(self, point: em.Point) -> None:
-                clicks.append(point)
+            class FakeInputBackend:
+                def click(self, point: em.Point) -> None:
+                    clicks.append(point)
 
-        try:
-            em_commands.WindowBackend = FakeWindowBackend
-            em_commands.InputBackend = FakeInputBackend
-            em_commands.refresh_point_from_saved_offset = lambda backend: em.Point(184, 186)
+            try:
+                root = Path(tmp)
+                em_core.CONFIG_COMMENT = root / ".wechat_comment_config"
+                em_core.CONFIG_REFRESH = root / ".wechat_refresh_point"
+                em_commands.CONFIG_REFRESH = em_core.CONFIG_REFRESH
+                em.save_comment_config(
+                    em.CommentConfig(
+                        comment_from_action=em.Point(-66, -3),
+                        send_x_ratio=0.859375,
+                        send_from_action=em.Point(-33, 99),
+                    )
+                )
+                em.save_point(em_core.CONFIG_REFRESH, em.Point(184, 186))
+                em_commands.WindowBackend = FakeWindowBackend
+                em_commands.InputBackend = FakeInputBackend
 
-            with redirect_stdout(io.StringIO()):
-                with self.assertRaises(em.WindowPositionUnavailable):
-                    em.cmd_comment(["--text", "1", "--user", "fn", "--rounds", "2"])
+                with redirect_stdout(io.StringIO()):
+                    with self.assertRaises(em.EasyMoneyError):
+                        em.cmd_comment(["--text", "1", "--user", "fn", "--rounds", "2"])
 
-            self.assertEqual(clicks, [])
-        finally:
-            em_commands.WindowBackend = old_window_backend
-            em_commands.InputBackend = old_input_backend
-            em_commands.refresh_point_from_saved_offset = old_refresh_point
+                self.assertEqual([(int(point.x), int(point.y)) for point in clicks], [(284, 386)])
+                self.assertEqual(window_backends[0].rect_calls, 1)
+            finally:
+                em_core.CONFIG_COMMENT = old_comment_config
+                em_core.CONFIG_REFRESH = old_refresh_config
+                em_commands.CONFIG_REFRESH = old_commands_refresh_config
+                em_commands.WindowBackend = old_window_backend
+                em_commands.InputBackend = old_input_backend
 
     def test_parse_comment_options_collects_comment_modes(self):
         options = em.parse_comment_options([
@@ -287,6 +343,109 @@ class EasyMoneyWinTests(unittest.TestCase):
         self.assertEqual(rects[2], em.Rect(424, 324, 544, 444))
         self.assertEqual(rects[3], em.Rect(176, 448, 296, 568))
 
+    def test_single_uia_inline_image_region_uses_keyboard_focus_and_loaded_check(self):
+        old_window_backend = em_llm.WindowBackend
+        old_input_backend = em_llm.InputBackend
+        old_capture_backend = em_llm.CaptureBackend
+        old_loaded_check = em_llm.inline_image_looks_loaded
+        old_env = {
+            key: os.environ.get(key)
+            for key in (
+                "EASYMONEY_SINGLE_IMAGE_ACTIVATE_WAIT_MS",
+                "EASYMONEY_SINGLE_IMAGE_FOCUS_WAIT_MS",
+                "EASYMONEY_SINGLE_IMAGE_KEY_GAP_MS",
+            )
+        }
+        events: list[tuple[str, object]] = []
+        focused = object()
+        cropped = object()
+        test_case = self
+
+        class FakeAutomation:
+            def GetFocusedElement(self) -> object:
+                events.append(("focused", None))
+                return focused
+
+        class FakeWindowBackend:
+            def moments_window(self) -> object:
+                events.append(("moments_window", None))
+                return object()
+
+            def activate(self, win: object) -> None:
+                events.append(("activate", None))
+
+            def _ensure_automation(self):
+                return FakeAutomation(), object()
+
+            def rect(self, element: object) -> em.Rect:
+                test_case.assertIs(element, focused)
+                return em.Rect(176, 324, 296, 444)
+
+            def _safe_text(self, element: object) -> str:
+                return "图片"
+
+            def _control_type(self, element: object) -> str:
+                return "按钮"
+
+            def _class_name(self, element: object) -> str:
+                return "mmui::XMouseEventView"
+
+        class FakeInputBackend:
+            def prepare_key_sequence(self, keys) -> None:
+                events.append(("prepare", tuple(keys)))
+
+            def press_sequence(self, keys, gap: float = 0.0) -> None:
+                events.append(("press", (tuple(keys), gap)))
+
+        class FakeWindowImage:
+            width = 1000
+            height = 1000
+
+            def crop(self, box):
+                events.append(("crop", box))
+                return cropped
+
+        class FakeCaptureBackend:
+            def screenshot_stream(self, rect: em.Rect) -> FakeWindowImage:
+                events.append(("screenshot_stream", rect))
+                return FakeWindowImage()
+
+            def close(self) -> None:
+                events.append(("close", None))
+
+        try:
+            os.environ["EASYMONEY_SINGLE_IMAGE_ACTIVATE_WAIT_MS"] = "0"
+            os.environ["EASYMONEY_SINGLE_IMAGE_FOCUS_WAIT_MS"] = "0"
+            os.environ["EASYMONEY_SINGLE_IMAGE_KEY_GAP_MS"] = "0"
+            em_llm.WindowBackend = FakeWindowBackend
+            em_llm.InputBackend = FakeInputBackend
+            em_llm.CaptureBackend = FakeCaptureBackend
+            em_llm.inline_image_looks_loaded = lambda image: image is cropped
+
+            post = em.MomentPostResolution(
+                body_frame=em.Rect(100, 200, 500, 600),
+                action_point=em.Point(300, 560),
+                text="Doudo 包含1张图片",
+                source="test",
+                inline_image_count=1,
+            )
+            image = em_llm.capture_single_uia_inline_image_region(post, em.Rect(0, 0, 1000, 1000))
+
+            self.assertIs(image, cropped)
+            self.assertIn(("prepare", ("down", "tab", "tab", "tab")), events)
+            self.assertIn(("press", (("down", "tab", "tab", "tab"), 0.0)), events)
+            self.assertIn(("crop", (176, 324, 296, 444)), events)
+        finally:
+            em_llm.WindowBackend = old_window_backend
+            em_llm.InputBackend = old_input_backend
+            em_llm.CaptureBackend = old_capture_backend
+            em_llm.inline_image_looks_loaded = old_loaded_check
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def test_parse_comment_options_rejects_removed_local_kb_flags(self):
         with self.assertRaises(em.EasyMoneyError):
             em.parse_comment_options(["--text", "好看", "--user", "fn", "--noLocal"])
@@ -317,6 +476,7 @@ class EasyMoneyWinTests(unittest.TestCase):
             old_submit_mode = os.environ.pop("EASYMONEY_SUBMIT_MODE", None)
             events: list[tuple[str, object]] = []
             window_backends: list[object] = []
+            include_text_values: list[bool] = []
 
             class FakeWindowBackend:
                 def __init__(self) -> None:
@@ -366,15 +526,21 @@ class EasyMoneyWinTests(unittest.TestCase):
                 em_commands.WindowBackend = FakeWindowBackend
                 em_commands.InputBackend = FakeInputBackend
                 em_commands.refresh_point_from_saved_offset = lambda backend: em.Point(153, 43)
-                em_commands.resolve_second_uia_list_item_post = lambda *args, **kwargs: em.UIAListItemResolution(
-                    item_index=1,
-                    body_frame=em.Rect(80, 100, 340, 170),
-                    action_point=em.Point(300, 160),
-                    text="fn post",
-                    expected_user_id="fn",
-                    detected_prefix="fn",
-                    elapsed_ms=3,
-                )
+
+                def fake_resolve_second(*args, **kwargs):
+                    include_text = kwargs.get("include_text", True)
+                    include_text_values.append(include_text)
+                    return em.UIAListItemResolution(
+                        item_index=1,
+                        body_frame=em.Rect(80, 100, 340, 170),
+                        action_point=em.Point(300, 160),
+                        text="fn post" if include_text else "",
+                        expected_user_id="fn",
+                        detected_prefix="fn",
+                        elapsed_ms=3,
+                    )
+
+                em_commands.resolve_second_uia_list_item_post = fake_resolve_second
 
                 with redirect_stdout(io.StringIO()):
                     em.cmd_comment(["--text", "1", "--user", "fn", "--rounds", "1"])
@@ -392,6 +558,7 @@ class EasyMoneyWinTests(unittest.TestCase):
                     ("click", (267, 259, 1)),
                 ])
                 self.assertEqual(window_backends[0].moments_window_calls, 1)
+                self.assertEqual(include_text_values, [False])
             finally:
                 em_core.CONFIG_COMMENT = old_comment_config
                 em_commands.WindowBackend = old_window_backend

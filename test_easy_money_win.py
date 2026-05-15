@@ -67,6 +67,38 @@ class EasyMoneyWinTests(unittest.TestCase):
             "豆包答案",
         )
 
+    def test_local_question_rules_extract_explicit_answer(self):
+        solved = em.solve_post_question_by_rules("今日问题：谁是凶手？答案：管家。评论后领取线索")
+
+        self.assertEqual(solved.answer, "管家")
+        self.assertEqual(solved.source, "local-rules")
+
+    def test_local_question_rules_extract_comment_token(self):
+        solved = em.solve_post_question_by_rules("活动暗号来啦，请评论「开门」参与")
+
+        self.assertEqual(solved.answer, "开门")
+
+    def test_local_question_rules_solves_simple_arithmetic(self):
+        solved = em.solve_post_question_by_rules("热身题：12 + 30 ÷ 3 = ?")
+
+        self.assertEqual(solved.answer, "22")
+
+    def test_local_question_rules_normalizes_choice_answer(self):
+        solved = em.solve_post_question_by_rules("单选题：选Ｂ")
+
+        self.assertEqual(solved.answer, "B")
+
+    def test_resolve_comment_text_uses_local_rules_without_llm(self):
+        post = em.MomentPostResolution(
+            body_frame=em.Rect(0, 0, 100, 100),
+            action_point=em.Point(50, 90),
+            text="问题：今日口令是什么？口令：红月",
+            source="test",
+        )
+        options = em.CommentOptions(solve_question=True)
+
+        self.assertEqual(em_commands.resolve_comment_text(options, post, em.Rect(0, 0, 200, 200)), "红月")
+
     def test_window_backend_uses_pywinauto_desktop(self):
         old_require_module = em_uia.require_module
         calls: list[tuple[str, object]] = []

@@ -99,12 +99,12 @@ python .\easy_money_win.py locate
 python .\easy_money_win.py capture-info --backend dxgi
 python .\easy_money_win.py run --interval 15
 python .\easy_money_win.py comment --solve-question --user 方南
-python .\easy_money_win.py comment --doubao --user 方南
+python .\easy_money_win.py comment --doubao --user 方南  # 兼容别名，走本地规则
 python .\easy_money_win.py comment --LLM --user 方南
 python .\easy_money_win.py comment --LLM --vision --user 方南
 python .\easy_money_win.py comment --LLM --vision --save-vision-image --vision-output .\vision.png --user 方南 --debug
 python .\easy_money_win.py llm ask "问题"
-python .\easy_money_win.py doubao ask "朋友圈正文"
+python .\easy_money_win.py doubao ask "朋友圈正文"  # 兼容入口，走本地规则
 ```
 
 ## 测试
@@ -117,6 +117,8 @@ python -m unittest discover -s tests
 ```
 
 ## 视觉能力
+
+`--solve-question` 默认只用本地规则推理，不访问 LLM。当前规则会优先提取正文里的“答案/谜底/口令/暗号/密码”、评论/回复口令、简单选项提示和基础四则运算；没有命中时输出“不知道”。需要模型推理时显式使用 `--LLM`。
 
 `--LLM --vision` 不再依赖额外目标检测模型或视觉推理库。脚本会优先读取 UIA 正文中的“包含 x 张图片”提示；检测到 2-9 张图片时，按 Swift 版相同的相对坐标裁剪图片网格、去除 4px 间隔并拼接成一张图发给 LLM。其他情况会回退为当前动态正文/图片附近区域截图。
 

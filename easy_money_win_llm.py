@@ -150,7 +150,7 @@ def generic_llm_system_prompt() -> str:
     return "你是一个可靠的中文助手。回答要直接、简洁。"
 
 
-def doubao_question_solve_system_prompt() -> str:
+def question_solve_system_prompt() -> str:
     return "你在帮助用户根据朋友圈正文回答剧本杀/活动相关问题。只输出最终答案；不知道就输出“不知道”。"
 
 
@@ -160,8 +160,84 @@ def build_generic_llm_user_prompt(prompt: str, context: str = "") -> str:
     return prompt.strip()
 
 
-def build_doubao_question_prompt(post_text: str) -> str:
+def build_question_solve_prompt(post_text: str) -> str:
     return f"请根据下面朋友圈正文回答问题，只输出答案：\n\n{post_text.strip()}"
+
+
+def _compact_post_text(post_text: str) -> str:
+    return re.sub(r"\s+", " ", post_text).strip()
+
+
+def _strip_answer_noise(answer: str) -> str:
+    cleaned = answer.strip()
+    cleaned = re.sub(r"^(?:答案|回答|回复|评论|留言|口令|暗号|密码)\s*[:：是为]?\s*", "", cleaned)
+    cleaned = cleaned.strip(" \t\r\n\"'“”‘’「」『』【】[]()（）")
+    return cleaned.strip()
+
+
+def _first_rule_answer(patterns: Iterable[str], text: str) -> tuple[Optional[str], str]:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        answer = _strip_answer_noise(match.group(1))
+        if answer:
+            return answer, pattern
+    return None, ""
+
+
+def _solve_simple_arithmetic(text: str) -> Optional[str]:
+    expression_pattern = re.compile(r"(?<![\w.])(-?\d+(?:\.\d+)?(?:\s*[+\-*/×÷]\s*-?\d+(?:\.\d+)?)+)\s*(?:=|等于|是多少|几|？|\?)")
+    match = expression_pattern.search(text)
+    if not match:
+        return None
+    expression = match.group(1).replace("×", "*").replace("÷", "/")
+    if not re.fullmatch(r"[\d+\-*/. ()]+", expression):
+        return None
+    try:
+        value = eval(expression, {"__builtins__": {}}, {})
+    except Exception:
+        return None
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, (int, float)):
+        return f"{value:.6g}"
+    return None
+
+
+def solve_post_question_by_rules(post_text: str) -> SolvedQuestion:
+    text = _compact_post_text(post_text)
+    if not text:
+        return SolvedQuestion(answer="不知道", evidence="本地规则: 空正文", confidence=0.0, source="local-rules")
+
+    answer, pattern = _first_rule_answer(
+        [
+            r"(?:正确答案|标准答案|参考答案|答案)\s*(?:是|为|:|：)\s*([^。！？!?\n\r；;，,]{1,64})",
+            r"(?:谜底|口令|暗号|密码)\s*(?:为|:|：)\s*([^。！？!?\n\r；;，,]{1,64})",
+            r"(?:请|可)?(?:评论|回复|留言|输入|发送)\s*[\"'“”‘’「」『』【】\[\]]?\s*([^\"'“”‘’「」『』【】\[\]。！？!?\n\r；;，,]{1,64})",
+            r"(?:把|将)\s*[\"'“”‘’「」『』【】\[\]]?\s*([^\"'“”‘’「」『』【】\[\]。！？!?\n\r；;，,]{1,64})\s*(?:发|打|写|填|评论|回复|留言|输入|发送)",
+        ],
+        text,
+    )
+    if answer:
+        return SolvedQuestion(answer=answer, evidence=f"本地规则: {pattern}", confidence=0.88, source="local-rules")
+
+    choice, pattern = _first_rule_answer(
+        [
+            r"(?:选|选择|答案)\s*([A-HＡ-Ｈ])\b",
+            r"\b([A-HＡ-Ｈ])\s*(?:选项)?\s*(?:正确|对了|为答案)",
+        ],
+        text,
+    )
+    if choice:
+        normalized_choice = choice.translate(str.maketrans("ＡＢＣＤＥＦＧＨ", "ABCDEFGH")).upper()
+        return SolvedQuestion(answer=normalized_choice, evidence=f"本地规则: {pattern}", confidence=0.78, source="local-rules")
+
+    arithmetic = _solve_simple_arithmetic(text)
+    if arithmetic:
+        return SolvedQuestion(answer=arithmetic, evidence="本地规则: 四则运算", confidence=0.82, source="local-rules")
+
+    return SolvedQuestion(answer="不知道", evidence="本地规则: 未命中", confidence=0.0, source="local-rules")
 
 
 def parse_openai_compatible_response(root: dict[str, Any]) -> Optional[str]:
@@ -305,17 +381,6 @@ def ask_local_llm(prompt: str, context: str = "") -> Optional[str]:
         print_ts("LLM 配置缺失：请设置 EASYMONEY_LLM_MODEL 或 DOUBAO/ARK_MODEL")
         return None
     return request_llm_answer(config, generic_llm_system_prompt(), build_generic_llm_user_prompt(prompt, context))
-
-
-def ask_doubao_to_solve_post(post_text: str, image_data_urls: Optional[list[str]] = None) -> Optional[SolvedQuestion]:
-    config = load_local_llm_config()
-    if not config:
-        print_ts("豆包/LLM 配置缺失：请检查 .easyMoney.env")
-        return None
-    answer = request_llm_answer(config, doubao_question_solve_system_prompt(), build_doubao_question_prompt(post_text), image_data_urls=image_data_urls)
-    if not answer:
-        return None
-    return SolvedQuestion(answer=answer, evidence="LLM", confidence=0.62, source=config.provider)
 
 
 def image_to_data_url(image: Any, max_side: int = 1280, quality: int = 78) -> str:

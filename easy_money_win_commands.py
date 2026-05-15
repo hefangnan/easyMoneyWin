@@ -28,7 +28,7 @@ def print_usage() -> None:
   python easy_money_win.py input-bench --kind click|keys --count N --confirm-send
   python easy_money_win.py comment [--text 文本] [--solve-question|--doubao|--LLM [--vision] [--save-vision-image] [--vision-output 路径]] --user <用户名前缀> [--debug] [--timing-detail]
   python easy_money_win.py llm ask "<问题>" [上下文]
-  python easy_money_win.py doubao ask "<朋友圈正文>"
+  python easy_money_win.py doubao ask "<朋友圈正文>"  # 兼容入口：本地规则答题
 """
     )
 
@@ -860,6 +860,13 @@ def resolve_comment_text(
     context = post.text.strip()
     if not context:
         raise EasyMoneyError("需要自动答题但未能读取朋友圈正文")
+
+    if not options.use_llm:
+        solved = solve_post_question_by_rules(context)
+        final_text = solved.answer
+        print_ts(f"本地规则命中: {solved.answer} ({solved.evidence})")
+        return final_text
+
     image_urls: list[str] = []
     if options.use_vision:
         vision_save_path = None
@@ -869,10 +876,19 @@ def resolve_comment_text(
         print_ts(f"已附带视觉截图: {len(image_urls)} 张")
         if vision_save_path is not None:
             print_ts(f"视觉截图已保存: {vision_save_path}")
-    solved = ask_doubao_to_solve_post(context, image_data_urls=image_urls)
-    if solved:
-        final_text = solved.answer
-        print_ts(f"LLM 命中: {solved.answer}")
+    config = load_local_llm_config()
+    if config:
+        answer = request_llm_answer(
+            config,
+            question_solve_system_prompt(),
+            build_question_solve_prompt(context),
+            image_data_urls=image_urls,
+        )
+        if answer:
+            final_text = answer
+            print_ts(f"LLM 命中: {answer}")
+    else:
+        print_ts("LLM 配置缺失：请检查 .easyMoney.env")
     if not final_text and options.comment_text:
         final_text = options.comment_text.strip()
         print_ts("自动答题未命中，回退到 --text")
@@ -1076,10 +1092,7 @@ def cmd_llm(args: list[str]) -> int:
 def cmd_doubao(args: list[str]) -> int:
     if len(args) < 2 or args[0] != "ask":
         raise EasyMoneyError('用法: doubao ask "<朋友圈正文>"')
-    solved = ask_doubao_to_solve_post(args[1])
-    if not solved:
-        print("未能回答")
-        return 1
+    solved = solve_post_question_by_rules(args[1])
     print(f"答案: {solved.answer}")
     if solved.evidence:
         print(f"证据: {solved.evidence}")

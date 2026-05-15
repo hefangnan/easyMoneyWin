@@ -112,57 +112,6 @@ class CaptureBackend:
             pass
 
 
-def quick_capture_fingerprint(capture: CaptureBackend, rect: Rect) -> Optional[int]:
-    try:
-        shot = capture.grab(rect)
-    except Exception:
-        return None
-    width, height = int(shot.width), int(shot.height)
-    if width <= 0 or height <= 0:
-        return None
-    data = shot.rgb
-    samples: list[int] = []
-    for row in range(8):
-        y = min(height - 1, max(0, int((row + 0.5) * height / 8)))
-        for col in range(8):
-            x = min(width - 1, max(0, int((col + 0.5) * width / 8)))
-            idx = (y * width + x) * 3
-            r, g, b = data[idx], data[idx + 1], data[idx + 2]
-            samples.append((int(r) * 30 + int(g) * 59 + int(b) * 11) // 100)
-    avg = sum(samples) / max(1, len(samples))
-    fingerprint = 0
-    for value in samples:
-        fingerprint = (fingerprint << 1) | (1 if value >= avg else 0)
-    return fingerprint
-
-
-def fingerprint_distance(lhs: int, rhs: int) -> int:
-    return (lhs ^ rhs).bit_count()
-
-
-def wait_for_region_refresh(
-    capture: CaptureBackend,
-    region: Rect,
-    baseline_fingerprint: Optional[int],
-    timeout_seconds: float = COMMENT_REFRESH_WAIT_SECONDS,
-) -> bool:
-    deadline = time.perf_counter() + max(0.001, timeout_seconds)
-    next_check = time.perf_counter()
-    while time.perf_counter() < deadline:
-        now = time.perf_counter()
-        if now >= next_check:
-            current = quick_capture_fingerprint(capture, region)
-            if current is not None:
-                if baseline_fingerprint is None:
-                    return True
-                if fingerprint_distance(baseline_fingerprint, current) >= 10:
-                    return True
-            next_check = now + COMMENT_REFRESH_CAPTURE_INTERVAL_SECONDS
-        else:
-            time.sleep(COMMENT_REFRESH_IDLE_SECONDS)
-    return False
-
-
 def refresh_observation_region(window_rect: Rect) -> Rect:
     return Rect(
         window_rect.left,

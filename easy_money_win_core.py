@@ -19,8 +19,6 @@ from typing import Any, Callable, Iterable, Optional
 APP_NAME = "easyMoney Windows"
 APP_VERSION = "0.1.0"
 COMMENT_REFRESH_WAIT_SECONDS = 0.1
-COMMENT_REFRESH_CAPTURE_INTERVAL_SECONDS = 0.012
-COMMENT_REFRESH_IDLE_SECONDS = 0.003
 
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
@@ -28,11 +26,8 @@ KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 DIRECT_TEXT_ENTRY_MAX_UTF16_UNITS = 512
 DIRECT_TEXT_ENTRY_CHUNK_UTF16_UNITS = 64
-MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
-MOUSEEVENTF_ABSOLUTE = 0x8000
-MOUSEEVENTF_VIRTUALDESK = 0x4000
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
@@ -251,7 +246,6 @@ class CommentSendResult:
 
 
 HOME = Path.home()
-EASYMONEY_DIR = HOME / ".easyMoney"
 CONFIG_REFRESH = HOME / ".wechat_refresh_offset"
 CONFIG_COMMENT = HOME / ".wechat_comment_config"
 CONFIG_POST_IMAGE_TAP_OFFSET = HOME / ".wechat_post_image_tap_offset"
@@ -434,45 +428,6 @@ BLOCKED_TEXT_SNIPPETS = {
     "详情",
     "收起",
 }
-
-
-def chinese_image_count_value(raw: str) -> Optional[int]:
-    text = raw.strip()
-    if not text:
-        return None
-    try:
-        return int(text)
-    except ValueError:
-        pass
-    values = {
-        "一": 1,
-        "二": 2,
-        "两": 2,
-        "三": 3,
-        "四": 4,
-        "五": 5,
-        "六": 6,
-        "七": 7,
-        "八": 8,
-        "九": 9,
-    }
-    if text == "十":
-        return 10
-    if text.startswith("十") and len(text) > 1:
-        ones = values.get(text[-1])
-        return 10 + ones if ones is not None else None
-    if text.endswith("十") and len(text) > 1:
-        tens = values.get(text[0])
-        return tens * 10 if tens is not None else None
-    if "十" in text:
-        first, _, last = text.partition("十")
-        tens = values.get(first[:1])
-        ones = values.get(last[:1])
-        if tens is not None and ones is not None:
-            return tens * 10 + ones
-    if len(text) == 1:
-        return values.get(text)
-    return None
 
 
 def extract_inline_image_count(text: str) -> Optional[int]:

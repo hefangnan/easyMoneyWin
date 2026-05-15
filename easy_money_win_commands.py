@@ -168,27 +168,6 @@ def cmd_uia_dump(args: list[str]) -> int:
     return 0
 
 
-def click_button_by_title(
-    backend: WindowBackend,
-    root: Any,
-    input_backend: InputBackend,
-    title: str,
-    automation_id: Optional[str] = None,
-) -> Optional[Point]:
-    for btn in backend.find_buttons(root):
-        name = backend._safe_text(btn)
-        button_id = backend._automation_id(btn)
-        if title and title not in name:
-            continue
-        if automation_id and automation_id != button_id:
-            continue
-        rect = backend.rect(btn)
-        if not backend.click_control(btn, input_backend, prefer_coordinate=True):
-            return None
-        return rect.center if rect is not None else None
-    return None
-
-
 def refresh_point_from_saved_offset(backend: WindowBackend) -> Optional[Point]:
     offset = load_point(CONFIG_REFRESH)
     if offset is None:

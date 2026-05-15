@@ -481,13 +481,6 @@ def uia_list_item_matches_user_id(text: str, expected_user_id: str) -> bool:
     return text.lstrip().startswith(expected)
 
 
-def short_log_text(text: str, limit: int = 48) -> str:
-    clean = text.replace("\r", " ").replace("\n", " ").strip()
-    if len(clean) <= limit:
-        return clean
-    return clean[:limit] + "..."
-
-
 def is_sns_list_control(window_backend: WindowBackend, node: Any) -> bool:
     return window_backend._automation_id(node) == "sns_list" and window_backend._control_type(node).lower() == "list"
 

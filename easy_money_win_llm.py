@@ -452,14 +452,8 @@ def inline_image_looks_loaded(image: Any) -> bool:
 
 
 def inline_image_load_timeout_ms() -> int:
-    timeout_ms = max(
-        80,
-        min(
-            int(first_non_empty_env(["EASYMONEY_AX_IMAGE_LOAD_TIMEOUT_MS", "EASYMONEY_DOUBAO_AX_IMAGE_LOAD_TIMEOUT_MS"]) or "1200"),
-            8000,
-        ),
-    )
-    return timeout_ms
+    timeout_ms = int(first_non_empty_env(["EASYMONEY_AX_IMAGE_LOAD_TIMEOUT_MS", "EASYMONEY_DOUBAO_AX_IMAGE_LOAD_TIMEOUT_MS"]) or "600")
+    return max(80, timeout_ms)
 
 
 def inline_image_load_interval_ms() -> int:

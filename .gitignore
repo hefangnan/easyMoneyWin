@@ -11,4 +11,3 @@ __pycache__/
 *.lib
 *.exp
 *.ilk
-script_player_counts.json

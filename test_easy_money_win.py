@@ -328,8 +328,10 @@ class EasyMoneyWinTests(unittest.TestCase):
 
     def test_extract_inline_image_count_supports_chinese_and_digits(self):
         self.assertEqual(em.extract_inline_image_count("正文\n包含3张图片"), 3)
-        self.assertEqual(em.extract_inline_image_count("这条含两张图片"), 2)
-        self.assertEqual(em.extract_inline_image_count("包含十二张图片"), 9)
+        self.assertEqual(em.extract_inline_image_count("这条包含9张图片"), 9)
+        self.assertIsNone(em.extract_inline_image_count("这条包含两张图片"))
+        self.assertIsNone(em.extract_inline_image_count("包含12张图片"))
+        self.assertIsNone(em.extract_inline_image_count("这条含两张图片"))
         self.assertIsNone(em.extract_inline_image_count("没有图片提示"))
 
     def test_direct_uia_inline_image_rects_match_swift_grid(self):
@@ -446,6 +448,107 @@ class EasyMoneyWinTests(unittest.TestCase):
                 else:
                     os.environ[key] = value
 
+    def test_single_uia_inline_image_region_tabs_once_more_when_focus_name_is_not_image(self):
+        old_window_backend = em_llm.WindowBackend
+        old_input_backend = em_llm.InputBackend
+        old_capture_backend = em_llm.CaptureBackend
+        old_loaded_check = em_llm.inline_image_looks_loaded
+        old_env = {
+            key: os.environ.get(key)
+            for key in (
+                "EASYMONEY_SINGLE_IMAGE_FOCUS_WAIT_MS",
+                "EASYMONEY_SINGLE_IMAGE_KEY_GAP_MS",
+            )
+        }
+        events: list[tuple[str, object]] = []
+        first_focus = object()
+        image_focus = object()
+        cropped = object()
+        test_case = self
+
+        class FakeAutomation:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def GetFocusedElement(self) -> object:
+                self.calls += 1
+                focused = first_focus if self.calls == 1 else image_focus
+                events.append(("focused", focused))
+                return focused
+
+        automation = FakeAutomation()
+
+        class FakeWindowBackend:
+            def _ensure_automation(self):
+                return automation, object()
+
+            def rect(self, element: object) -> em.Rect:
+                test_case.assertIs(element, image_focus)
+                return em.Rect(180, 330, 300, 450)
+
+            def _safe_text(self, element: object) -> str:
+                return "评论" if element is first_focus else "图片"
+
+            def _control_type(self, element: object) -> str:
+                return "按钮"
+
+            def _class_name(self, element: object) -> str:
+                return "mmui::XMouseEventView" if element is image_focus else ""
+
+        class FakeInputBackend:
+            def prepare_key_sequence(self, keys) -> None:
+                events.append(("prepare", tuple(keys)))
+
+            def press_sequence(self, keys, gap: float = 0.0) -> None:
+                events.append(("press", (tuple(keys), gap)))
+
+        class FakeWindowImage:
+            width = 1000
+            height = 1000
+
+            def crop(self, box):
+                events.append(("crop", box))
+                return cropped
+
+        class FakeCaptureBackend:
+            def screenshot_stream(self, rect: em.Rect) -> FakeWindowImage:
+                return FakeWindowImage()
+
+            def close(self) -> None:
+                pass
+
+        try:
+            os.environ["EASYMONEY_SINGLE_IMAGE_FOCUS_WAIT_MS"] = "0"
+            os.environ["EASYMONEY_SINGLE_IMAGE_KEY_GAP_MS"] = "0"
+            em_llm.WindowBackend = FakeWindowBackend
+            em_llm.InputBackend = FakeInputBackend
+            em_llm.CaptureBackend = FakeCaptureBackend
+            em_llm.inline_image_looks_loaded = lambda image: image is cropped
+
+            post = em.MomentPostResolution(
+                body_frame=em.Rect(100, 200, 500, 600),
+                action_point=em.Point(300, 560),
+                text="Doudo 包含1张图片",
+                source="test",
+                inline_image_count=1,
+            )
+            image = em_llm.capture_single_uia_inline_image_region(post, em.Rect(0, 0, 1000, 1000))
+
+            self.assertIs(image, cropped)
+            self.assertIn(("press", (("down", "tab", "tab", "tab"), 0.0)), events)
+            self.assertIn(("press", (("tab",), 0.0)), events)
+            self.assertIn(("crop", (180, 330, 300, 450)), events)
+        finally:
+            em_llm.WindowBackend = old_window_backend
+            em_llm.InputBackend = old_input_backend
+            em_llm.CaptureBackend = old_capture_backend
+            em_llm.inline_image_looks_loaded = old_loaded_check
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def test_parse_comment_options_rejects_removed_local_kb_flags(self):
         with self.assertRaises(em.EasyMoneyError):
             em.parse_comment_options(["--text", "好看", "--user", "fn", "--noLocal"])
@@ -465,6 +568,15 @@ class EasyMoneyWinTests(unittest.TestCase):
             with self.subTest(args=args):
                 with self.assertRaises(em.EasyMoneyError):
                     em.parse_comment_options(args)
+
+    def test_comment_prefers_direct_input_when_backend_supports_text(self):
+        class FakeInputBackend:
+            def can_type_text_directly(self, text: str) -> bool:
+                return True
+
+        input_backend = FakeInputBackend()
+        self.assertTrue(em_commands.should_type_comment_text_directly("1", input_backend))
+        self.assertTrue(em_commands.should_type_comment_text_directly("6.7暗夜降至整车锁晓星", input_backend))
 
     def test_comment_sends_with_default_click_after_typing(self):
         with tempfile.TemporaryDirectory() as tmp:

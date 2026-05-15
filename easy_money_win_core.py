@@ -484,15 +484,7 @@ def chinese_image_count_value(raw: str) -> Optional[int]:
 
 
 def extract_inline_image_count(text: str) -> Optional[int]:
-    patterns = (
-        r"包含\s*([0-9一二两三四五六七八九十]+)\s*张图片",
-        r"含\s*([0-9一二两三四五六七八九十]+)\s*张图片",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text)
-        if not match:
-            continue
-        value = chinese_image_count_value(match.group(1))
-        if value is not None:
-            return max(1, min(value, 9))
-    return None
+    match = re.search(r"包含\s*([1-9])\s*张图片", text)
+    if not match:
+        return None
+    return int(match.group(1))

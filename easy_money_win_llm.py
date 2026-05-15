@@ -547,6 +547,14 @@ def locate_single_uia_inline_image_rect(post: MomentPostResolution, window_rect:
     focused = automation.GetFocusedElement()
     if focused is None:
         raise EasyMoneyError("单图键盘定位失败: 未读取到当前焦点元素")
+    if backend._safe_text(focused).strip() != "图片":
+        input_backend.prepare_key_sequence(("tab",))
+        input_backend.press_sequence(("tab",), gap=key_gap_ms / 1000.0)
+        if focus_wait_ms > 0:
+            time.sleep(focus_wait_ms / 1000.0)
+        focused = automation.GetFocusedElement()
+        if focused is None:
+            raise EasyMoneyError("单图键盘定位失败: 兜底Tab后未读取到当前焦点元素")
     focus_rect = backend.rect(focused)
     if focus_rect is None:
         raise EasyMoneyError("单图键盘定位失败: 当前焦点元素没有有效矩形")

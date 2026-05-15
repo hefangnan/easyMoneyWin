@@ -674,6 +674,24 @@ def resolve_comment_text(options: CommentOptions, post: MomentPostResolution, wi
     return final_text
 
 
+def should_type_comment_text_directly(text: str, input_backend: InputBackend) -> bool:
+    if not text:
+        return False
+    can_type_text_directly = getattr(input_backend, "can_type_text_directly", None)
+    if not callable(can_type_text_directly):
+        can_type_text_directly = getattr(input_backend, "can_type_directly", None)
+    return bool(callable(can_type_text_directly) and can_type_text_directly(text))
+
+
+def prewarm_comment_text_input(options: CommentOptions, input_backend: InputBackend) -> None:
+    text = (options.comment_text or "").strip()
+    if not should_type_comment_text_directly(text, input_backend):
+        return
+    prepare_text_input = getattr(input_backend, "prepare_text_input", None)
+    if callable(prepare_text_input):
+        prepare_text_input(text)
+
+
 def build_comment_send_plan(
     options: CommentOptions,
     post: MomentPostResolution,
@@ -711,11 +729,11 @@ def print_comment_debug(plan: CommentSendPlan, input_backend: InputBackend) -> N
     print(f"DEBUG: 评论内容: {plan.text}")
 
 
-def execute_comment_send_plan(plan: CommentSendPlan, input_backend: InputBackend) -> CommentSendResult:
-    can_type_text_directly = getattr(input_backend, "can_type_text_directly", None)
-    if not callable(can_type_text_directly):
-        can_type_text_directly = input_backend.can_type_directly
-    can_direct_type_text = can_type_text_directly(plan.text)
+def execute_comment_send_plan(
+    plan: CommentSendPlan,
+    input_backend: InputBackend,
+) -> CommentSendResult:
+    can_direct_type_text = should_type_comment_text_directly(plan.text, input_backend)
     input_backend.prepare_key_sequence(plan.open_comment_keys)
     if plan.submit_mode == "keys":
         input_backend.prepare_key_sequence(plan.submit_comment_keys)
@@ -806,6 +824,8 @@ def cmd_comment(args: list[str]) -> int:
     if not config and comment_requires_config(options):
         raise EasyMoneyError("未找到评论配置，请先运行 comment-locate")
 
+    input_backend = InputBackend()
+    prewarm_comment_text_input(options, input_backend)
     post, window_rect = resolve_comment_target_post_via_worker(
         options.requested_user,
         options.rounds,
@@ -815,7 +835,6 @@ def cmd_comment(args: list[str]) -> int:
 
     if options.save_post_image or options.test_image_crop:
         return save_comment_post_image(post, window_rect, options.save_path)
-    input_backend = InputBackend()
     if options.click_post_image:
         return click_comment_post_image(input_backend, post, window_rect, debug=options.debug)
 

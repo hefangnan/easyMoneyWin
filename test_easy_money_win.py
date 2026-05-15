@@ -402,6 +402,11 @@ class EasyMoneyWinTests(unittest.TestCase):
                 return "mmui::XMouseEventView"
 
         class FakeInputBackend:
+            instances = 0
+
+            def __init__(self) -> None:
+                type(self).instances += 1
+
             def prepare_key_sequence(self, keys) -> None:
                 events.append(("prepare", tuple(keys)))
 
@@ -431,6 +436,8 @@ class EasyMoneyWinTests(unittest.TestCase):
             em_llm.InputBackend = FakeInputBackend
             em_llm.CaptureBackend = FakeCaptureBackend
             em_llm.inline_image_looks_loaded = lambda image: image is cropped
+            input_backend = FakeInputBackend()
+            FakeInputBackend.instances = 0
 
             post = em.MomentPostResolution(
                 body_frame=em.Rect(100, 200, 500, 600),
@@ -439,9 +446,10 @@ class EasyMoneyWinTests(unittest.TestCase):
                 source="test",
                 inline_image_count=1,
             )
-            image = em_llm.capture_single_uia_inline_image_region(post, em.Rect(0, 0, 1000, 1000))
+            image = em_llm.capture_single_uia_inline_image_region(post, em.Rect(0, 0, 1000, 1000), input_backend=input_backend)
 
             self.assertIs(image, cropped)
+            self.assertEqual(FakeInputBackend.instances, 0)
             self.assertIn(("prepare", ("down", "tab", "tab", "tab")), events)
             self.assertIn(("press", (("down", "tab", "tab", "tab"), 0.0)), events)
             self.assertIn(("screenshot_stream", em.Rect(176, 324, 296, 444)), events)
@@ -504,6 +512,11 @@ class EasyMoneyWinTests(unittest.TestCase):
                 return "mmui::XMouseEventView" if element is image_focus else ""
 
         class FakeInputBackend:
+            instances = 0
+
+            def __init__(self) -> None:
+                type(self).instances += 1
+
             def prepare_key_sequence(self, keys) -> None:
                 events.append(("prepare", tuple(keys)))
 
@@ -533,6 +546,8 @@ class EasyMoneyWinTests(unittest.TestCase):
             em_llm.InputBackend = FakeInputBackend
             em_llm.CaptureBackend = FakeCaptureBackend
             em_llm.inline_image_looks_loaded = lambda image: image is cropped
+            input_backend = FakeInputBackend()
+            FakeInputBackend.instances = 0
 
             post = em.MomentPostResolution(
                 body_frame=em.Rect(100, 200, 500, 600),
@@ -541,9 +556,10 @@ class EasyMoneyWinTests(unittest.TestCase):
                 source="test",
                 inline_image_count=1,
             )
-            image = em_llm.capture_single_uia_inline_image_region(post, em.Rect(0, 0, 1000, 1000))
+            image = em_llm.capture_single_uia_inline_image_region(post, em.Rect(0, 0, 1000, 1000), input_backend=input_backend)
 
             self.assertIs(image, cropped)
+            self.assertEqual(FakeInputBackend.instances, 0)
             self.assertIn(("press", (("down", "tab", "tab", "tab"), 0.0)), events)
             self.assertIn(("press", (("tab",), 0.0)), events)
             self.assertIn(("screenshot_stream", em.Rect(180, 330, 300, 450)), events)

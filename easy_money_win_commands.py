@@ -645,7 +645,12 @@ def click_comment_post_image(
     return 0
 
 
-def resolve_comment_text(options: CommentOptions, post: MomentPostResolution, window_rect: Rect) -> str:
+def resolve_comment_text(
+    options: CommentOptions,
+    post: MomentPostResolution,
+    window_rect: Rect,
+    input_backend: Optional[InputBackend] = None,
+) -> str:
     final_text = (options.comment_text or "").strip()
     if not options.solve_question:
         return final_text
@@ -658,7 +663,7 @@ def resolve_comment_text(options: CommentOptions, post: MomentPostResolution, wi
         vision_save_path = None
         if options.save_vision_image:
             vision_save_path = options.vision_save_path or DEBUG_DIR / f"wechat_vision_image_{time.strftime('%Y%m%d_%H%M%S')}.png"
-        image_urls = capture_vision_image_data_urls(post, window_rect, save_path=vision_save_path)
+        image_urls = capture_vision_image_data_urls(post, window_rect, save_path=vision_save_path, input_backend=input_backend)
         print_ts(f"已附带视觉截图: {len(image_urls)} 张")
         if vision_save_path is not None:
             print_ts(f"视觉截图已保存: {vision_save_path}")
@@ -838,7 +843,7 @@ def cmd_comment(args: list[str]) -> int:
     if options.click_post_image:
         return click_comment_post_image(input_backend, post, window_rect, debug=options.debug)
 
-    final_text = resolve_comment_text(options, post, window_rect)
+    final_text = resolve_comment_text(options, post, window_rect, input_backend=input_backend)
     if config is None:
         raise EasyMoneyError("未找到评论配置，请先运行 comment-locate")
     plan = build_comment_send_plan(options, post, window_rect, config, final_text)

@@ -545,9 +545,14 @@ def focused_element_is_image_button(backend: WindowBackend, element: Any) -> boo
     return is_button and (name == "图片" or class_name == "mmui::XMouseEventView")
 
 
-def locate_single_uia_inline_image_rect(post: MomentPostResolution, window_rect: Rect) -> Rect:
+def locate_single_uia_inline_image_rect(
+    post: MomentPostResolution,
+    window_rect: Rect,
+    input_backend: Optional[InputBackend] = None,
+) -> Rect:
     backend = WindowBackend()
-    input_backend = InputBackend()
+    if input_backend is None:
+        input_backend = InputBackend()
 
     input_backend.prepare_key_sequence(SINGLE_IMAGE_FOCUS_KEYS)
     key_gap_ms = max(0, min(int(first_non_empty_env(["EASYMONEY_SINGLE_IMAGE_KEY_GAP_MS"]) or "30"), 1000))
@@ -581,8 +586,12 @@ def locate_single_uia_inline_image_rect(post: MomentPostResolution, window_rect:
     return crop_rect
 
 
-def capture_single_uia_inline_image_region(post: MomentPostResolution, window_rect: Rect) -> Any | None:
-    rect = locate_single_uia_inline_image_rect(post, window_rect)
+def capture_single_uia_inline_image_region(
+    post: MomentPostResolution,
+    window_rect: Rect,
+    input_backend: Optional[InputBackend] = None,
+) -> Any | None:
+    rect = locate_single_uia_inline_image_rect(post, window_rect, input_backend=input_backend)
     images = crop_loaded_inline_image_regions([rect], window_rect, "UIA单图")
     return images[0] if images else None
 
@@ -664,6 +673,7 @@ def capture_vision_image_data_urls(
     post: MomentPostResolution,
     window_rect: Rect,
     save_path: Optional[Path] = None,
+    input_backend: Optional[InputBackend] = None,
 ) -> list[str]:
     image_count = post.inline_image_count or extract_inline_image_count(post.text)
     if image_count is not None and 2 <= image_count <= 9:
@@ -676,7 +686,7 @@ def capture_vision_image_data_urls(
         image = stitched
         print_ts(f"  UIA裁剪图已去除4px间隔并拼接: {image.width}x{image.height}")
     elif image_count is not None and image_count == 1:
-        image = capture_single_uia_inline_image_region(post, window_rect)
+        image = capture_single_uia_inline_image_region(post, window_rect, input_backend=input_backend)
         if image is None:
             raise EasyMoneyError("--LLM --vision UIA单图裁剪未加载完成")
     else:

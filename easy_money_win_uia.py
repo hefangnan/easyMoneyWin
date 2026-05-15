@@ -155,6 +155,28 @@ class WindowBackend:
         except Exception as exc:
             raise EasyMoneyError(f"读取窗口列表失败: {exc}") from exc
 
+    def _find_moments_window_by_win32_class(self) -> Optional[Any]:
+        if os.name != "nt":
+            return None
+        try:
+            hwnd = ctypes.windll.user32.FindWindowW("mmui::SNSWindow", None)
+        except Exception:
+            return None
+        if not hwnd:
+            return None
+        try:
+            spec = self.desktop.window(handle=hwnd)
+            wrapper = spec.wrapper_object()
+            if wrapper is not None:
+                return wrapper
+        except Exception:
+            pass
+        try:
+            automation, _ = self._ensure_automation()
+            return automation.ElementFromHandle(ctypes.c_void_p(int(hwnd)))
+        except Exception:
+            return None
+
     def _ensure_automation(self) -> tuple[Any, Any]:
         if self._automation is None or self._uia_module is None:
             self._comtypes_client = require_module("comtypes.client", "comtypes")
@@ -237,6 +259,10 @@ class WindowBackend:
         return None
 
     def moments_window(self) -> Any:
+        fast = self._find_moments_window_by_win32_class()
+        if fast is not None:
+            return fast
+
         candidates = []
         fallback_candidates = []
         for win in self.windows():

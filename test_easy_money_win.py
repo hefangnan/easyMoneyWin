@@ -1,4 +1,5 @@
 import io
+import ctypes
 import os
 import tempfile
 import unittest
@@ -98,6 +99,46 @@ class EasyMoneyWinTests(unittest.TestCase):
             self.assertNotIn(("uiautomation", None), calls)
         finally:
             em_uia.require_module = old_require_module
+
+    def test_moments_window_prefers_win32_sns_class(self):
+        sentinel = object()
+
+        class FakeSpec:
+            def wrapper_object(self) -> object:
+                return sentinel
+
+        class FakeDesktop:
+            def __init__(self) -> None:
+                self.windows_called = False
+
+            def window(self, handle: int) -> FakeSpec:
+                self.handle = handle
+                return FakeSpec()
+
+            def windows(self):
+                self.windows_called = True
+                return []
+
+        class FakeUser32:
+            def FindWindowW(self, class_name: str, title: object) -> int:
+                self.args = (class_name, title)
+                return 12345
+
+        backend = object.__new__(em.WindowBackend)
+        backend.desktop = FakeDesktop()
+        backend._automation = None
+        backend._uia_module = None
+        backend._comtypes_client = None
+        backend._sns_list_cache = {}
+        backend._list_item_strategy_cache = {}
+        old_user32 = ctypes.windll.user32
+        try:
+            ctypes.windll.user32 = FakeUser32()
+            self.assertIs(backend.moments_window(), sentinel)
+            self.assertFalse(backend.desktop.windows_called)
+            self.assertEqual(backend.desktop.handle, 12345)
+        finally:
+            ctypes.windll.user32 = old_user32
 
     def test_sns_list_lookup_prefers_fast_path(self):
         sentinel = object()

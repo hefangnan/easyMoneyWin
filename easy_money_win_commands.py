@@ -16,7 +16,7 @@ def print_usage() -> None:
 用法:
   python easy_money_win.py run [--interval N] [--pos x,y] [--index N] [--title 文本] [--id id]
   python easy_money_win.py locate [--test-click]
-  python easy_money_win.py capture-info [--backend auto|dxgi|mss]
+  python easy_money_win.py capture-info [--backend dxgi]
   python easy_money_win.py uia-dump [--max-depth N] [--item-index N] [--item-limit N] [--full] [--watch] [--count N] [--timing-only]
   python easy_money_win.py ax-dump [--max-depth N] [--item-index N] [--item-limit N] [--full] [--watch] [--count N] [--timing-only]
   python easy_money_win.py comment-locate

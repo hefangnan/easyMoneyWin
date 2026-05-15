@@ -2,7 +2,7 @@
 
 `easy_money_win.py` 是 `easyMoney.swift` 的 Windows 第一版迁移入口。具体实现按功能拆在 `easy_money_win_core.py`、`easy_money_win_input.py`、`easy_money_win_capture.py`、`easy_money_win_uia.py`、`easy_money_win_llm.py`、`easy_money_win_commands.py`。它优先保留常用工作流：微信朋友圈窗口定位、按 `locate` 保存的刷新按钮坐标自动刷新、通过 UI Automation 读取朋友圈 `sns_list` 的第二条 `ListItem` 来匹配目标动态、自动评论、LLM/豆包答题、SQLite 知识库查询。
 
-这不是 Swift 版的逐行复刻。macOS 的 `AXUIElement`、`CGEvent`、`ScreenCaptureKit`、`Vision`、`CoreML` 在 Windows 上分别替换为 UI Automation、Win32 输入、DXGI Desktop Duplication（`dxcam`，`mss` 兜底）和普通截图视觉输入。第一版不默认启用 OCR，也不迁移 CoreML。
+这不是 Swift 版的逐行复刻。macOS 的 `AXUIElement`、`CGEvent`、`ScreenCaptureKit`、`Vision`、`CoreML` 在 Windows 上分别替换为 UI Automation、Win32 输入、DXGI Desktop Duplication（`dxcam`）和普通截图视觉输入。第一版不默认启用 OCR，也不迁移 CoreML。
 
 ## 安装
 
@@ -23,13 +23,11 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
 ```
 
-截图后端默认优先使用 DXGI：
+截图后端使用 DXGI：
 
-- `EASYMONEY_CAPTURE_BACKEND=auto`：默认，优先 `dxcam`，不可用时退回 `mss`
-- `EASYMONEY_CAPTURE_BACKEND=dxgi`：强制 DXGI，初始化失败会报错
-- `EASYMONEY_CAPTURE_BACKEND=mss`：强制旧截图后端
+- `EASYMONEY_CAPTURE_BACKEND=dxgi`：使用 DXGI，初始化失败会报错
 - `EASYMONEY_DXGI_OUTPUT=0`：选择 DXGI 输出编号，多显示器时可调整
-- `EASYMONEY_DXGI_STREAM_FPS=240`：DXGI 流采帧目标帧率，只在 DXGI 后端生效
+- `EASYMONEY_DXGI_STREAM_FPS=240`：DXGI 流采帧目标帧率
 
 ## 配置文件位置
 

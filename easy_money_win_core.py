@@ -148,14 +148,6 @@ class Rect:
             min(self.bottom, outer.bottom),
         )
 
-    def to_mss(self) -> dict[str, int]:
-        return {
-            "left": int(round(self.left)),
-            "top": int(round(self.top)),
-            "width": max(1, int(round(self.width))),
-            "height": max(1, int(round(self.height))),
-        }
-
     def describe(self) -> str:
         return f"({int(self.left)},{int(self.top)}) {int(self.width)}x{int(self.height)}"
 

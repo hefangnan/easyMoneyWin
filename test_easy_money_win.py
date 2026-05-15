@@ -682,12 +682,10 @@ class EasyMoneyWinTests(unittest.TestCase):
                 else:
                     os.environ["EASYMONEY_SUBMIT_MODE"] = old_submit_mode
 
-    def test_capture_backend_falls_back_to_mss_for_dxgi_invalid_region(self):
+    def test_capture_backend_raises_for_dxgi_invalid_region(self):
         backend = object.__new__(em.CaptureBackend)
         backend.backend = "dxgi"
-        backend._allow_mss_fallback = True
         backend._dx_stream_region = None
-        backend.mss_mod = object()
 
         class FakeDxCamera:
             is_capturing = False
@@ -698,23 +696,10 @@ class EasyMoneyWinTests(unittest.TestCase):
             def stop(self) -> None:
                 pass
 
-        class FakeShot:
-            width = 4
-            height = 3
-            rgb = bytes([10, 20, 30] * 12)
-
-        class FakeSct:
-            def grab(self, region: dict[str, int]) -> FakeShot:
-                self.region = region
-                return FakeShot()
-
         backend._dx_camera = FakeDxCamera()
-        backend._sct = FakeSct()
 
-        frame = backend.grab_stream(em.Rect(-20, 10, 20, 13))
-
-        self.assertEqual((frame.width, frame.height), (4, 3))
-        self.assertEqual(backend._sct.region["left"], -20)
+        with self.assertRaises(em.CaptureUnavailable):
+            backend.grab_stream(em.Rect(-20, 10, 20, 13))
 
     def test_capture_backend_uses_numpy_dxgi_processor(self):
         old_import_module = em_capture.importlib.import_module

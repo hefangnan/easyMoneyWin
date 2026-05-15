@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import concurrent.futures
+import dataclasses
+import math
 
 from easy_money_win_core import *
 from easy_money_win_input import *
@@ -23,6 +25,7 @@ def print_usage() -> None:
   python easy_money_win.py comment-fixed-send-locate
   python easy_money_win.py post-image-locate
   python easy_money_win.py post-image-x-locate
+  python easy_money_win.py input-bench --kind click|keys --count N --confirm-send
   python easy_money_win.py comment [--text 文本] [--solve-question|--doubao|--LLM [--vision] [--save-vision-image] [--vision-output 路径]] --user <用户名前缀> [--debug] [--timing-detail]
   python easy_money_win.py llm ask "<问题>" [上下文]
   python easy_money_win.py doubao ask "<朋友圈正文>"
@@ -55,6 +58,165 @@ def cmd_capture_info(args: list[str]) -> int:
     print(f"帧尺寸: {frame.width}x{frame.height}")
     print(f"截图耗时: {elapsed_ms}ms")
     capture.close()
+    return 0
+
+
+def percentile_nearest_rank(sorted_values: list[int], percentile: float) -> int:
+    if not sorted_values:
+        return 0
+    rank = max(1, int(math.ceil(percentile / 100.0 * len(sorted_values))))
+    return sorted_values[min(rank - 1, len(sorted_values) - 1)]
+
+
+def format_ns_as_ms(value_ns: int) -> str:
+    return f"{value_ns / 1_000_000:.3f}ms"
+
+
+def parse_point_text(raw: str, option_name: str = "--point") -> Point:
+    parts = [part.strip() for part in raw.split(",")]
+    if len(parts) != 2:
+        raise EasyMoneyError(f"{option_name} 格式应为 x,y")
+    return Point(float(parts[0]), float(parts[1]))
+
+
+def parse_input_bench_options(args: list[str]) -> InputBenchOptions:
+    options = InputBenchOptions()
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--kind":
+            value, i = parse_option_value(args, i, "--kind")
+            kind = value.strip().lower()
+            if kind not in {"click", "keys"}:
+                raise EasyMoneyError("--kind 只支持 click 或 keys")
+            options = dataclasses.replace(options, kind=kind)
+        elif arg == "--count":
+            value, i = parse_option_value(args, i, "--count")
+            options = dataclasses.replace(options, count=max(1, int(value)))
+        elif arg == "--warmup":
+            value, i = parse_option_value(args, i, "--warmup")
+            options = dataclasses.replace(options, warmup=max(0, int(value)))
+        elif arg == "--keys":
+            value, i = parse_option_value(args, i, "--keys")
+            options = dataclasses.replace(options, keys=parse_key_sequence_text(value, "--keys"))
+        elif arg == "--interval-ms":
+            value, i = parse_option_value(args, i, "--interval-ms")
+            options = dataclasses.replace(options, interval_ms=max(0, int(value)))
+        elif arg == "--countdown-ms":
+            value, i = parse_option_value(args, i, "--countdown-ms")
+            options = dataclasses.replace(options, countdown_ms=max(0, int(value)))
+        elif arg == "--point":
+            value, i = parse_option_value(args, i, "--point")
+            options = dataclasses.replace(options, point=parse_point_text(value, "--point"))
+        elif arg == "--confirm-send":
+            options = dataclasses.replace(options, confirm_send=True)
+        elif arg == "--priority-boost":
+            options = dataclasses.replace(options, priority_boost=True)
+        else:
+            raise EasyMoneyError(f"未知 input-bench 参数: {arg}")
+        i += 1
+    return options
+
+
+def collect_input_bench_stats(values_ns: list[int]) -> dict[str, int]:
+    if not values_ns:
+        raise EasyMoneyError("没有可统计的输入耗时")
+    sorted_values = sorted(values_ns)
+    return {
+        "min": sorted_values[0],
+        "p50": percentile_nearest_rank(sorted_values, 50),
+        "p95": percentile_nearest_rank(sorted_values, 95),
+        "p99": percentile_nearest_rank(sorted_values, 99),
+        "max": sorted_values[-1],
+        "avg": int(sum(sorted_values) / len(sorted_values)),
+    }
+
+
+def print_input_bench_stats(values_ns: list[int], failures: int) -> None:
+    stats = collect_input_bench_stats(values_ns)
+    slow_5ms = sum(1 for value in values_ns if value >= 5_000_000)
+    slow_10ms = sum(1 for value in values_ns if value >= 10_000_000)
+    top_values = sorted(values_ns, reverse=True)[:5]
+    print(
+        "SendInput 耗时统计: "
+        f"count={len(values_ns)} failures={failures} "
+        f"min={format_ns_as_ms(stats['min'])} "
+        f"p50={format_ns_as_ms(stats['p50'])} "
+        f"p95={format_ns_as_ms(stats['p95'])} "
+        f"p99={format_ns_as_ms(stats['p99'])} "
+        f"max={format_ns_as_ms(stats['max'])} "
+        f"avg={format_ns_as_ms(stats['avg'])}"
+    )
+    print(f"慢调用: >=5ms {slow_5ms}/{len(values_ns)} | >=10ms {slow_10ms}/{len(values_ns)}")
+    print("最慢 5 次: " + ", ".join(format_ns_as_ms(value) for value in top_values))
+
+
+def cmd_input_bench(args: list[str]) -> int:
+    options = parse_input_bench_options(args)
+    if not options.confirm_send:
+        raise EasyMoneyError("input-bench 会真实发送鼠标/键盘输入；确认后请加 --confirm-send")
+    if os.name != "nt":
+        raise EasyMoneyError("input-bench 只支持 Windows 原生 SendInput")
+    user32 = ctypes.windll.user32
+    user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+    user32.SendInput.restype = wintypes.UINT
+
+    if options.point is not None:
+        x, y = options.point.rounded()
+        user32.SetCursorPos(x, y)
+        print(f"已移动到压测坐标: ({int(options.point.x)}, {int(options.point.y)})")
+    if options.kind == "click":
+        down = INPUT()
+        down.type = INPUT_MOUSE
+        down.union.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, 0)
+        up = INPUT()
+        up.type = INPUT_MOUSE
+        up.union.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, 0)
+        events = [down, up]
+        label = "mouse click x1"
+    else:
+        events = []
+        for key in options.keys:
+            vk = InputBackend._vk(key)
+            down = INPUT()
+            down.type = INPUT_KEYBOARD
+            down.union.ki = KEYBDINPUT(vk, 0, 0, 0, 0)
+            up = INPUT()
+            up.type = INPUT_KEYBOARD
+            up.union.ki = KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, 0)
+            events.extend([down, up])
+        label = f"keys {format_key_sequence(options.keys)}"
+    array_type = INPUT * len(events)
+    event_array = array_type(*events)
+    count = len(events)
+
+    total_iterations = options.warmup + options.count
+    if options.countdown_ms > 0:
+        print(f"将在 {options.countdown_ms}ms 后开始真实发送输入；按 Ctrl+C 可取消")
+        precise_delay(options.countdown_ms / 1000.0)
+    print(
+        f"input-bench: kind={options.kind} label={label} count={options.count} "
+        f"warmup={options.warmup} interval={options.interval_ms}ms priority_boost={options.priority_boost}"
+    )
+
+    elapsed_values: list[int] = []
+    failures = 0
+    delay_seconds = options.interval_ms / 1000.0
+    priority_boost = CurrentThreadPriorityBoost(options.priority_boost)
+    with priority_boost:
+        for index in range(total_iterations):
+            started_ns = time.perf_counter_ns()
+            sent = user32.SendInput(count, event_array, ctypes.sizeof(INPUT))
+            elapsed_ns = time.perf_counter_ns() - started_ns
+            if index >= options.warmup:
+                if sent != count:
+                    failures += 1
+                elapsed_values.append(elapsed_ns)
+            if delay_seconds > 0 and index < total_iterations - 1:
+                precise_delay(delay_seconds)
+
+    print(f"输入线程优先级: {priority_boost.describe()}")
+    print_input_bench_stats(elapsed_values, failures)
     return 0
 
 
@@ -448,6 +610,67 @@ def uia_worker_thread_enabled() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def comment_input_priority_boost_enabled() -> bool:
+    value = os.environ.get("EASYMONEY_INPUT_PRIORITY_BOOST", "1").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+class CurrentThreadPriorityBoost:
+    def __init__(self, enabled: bool, priority: int = THREAD_PRIORITY_HIGHEST) -> None:
+        self.enabled = enabled
+        self.priority = priority
+        self.previous_priority: Optional[int] = None
+        self.applied = False
+        self.error = ""
+        self._kernel32: Any = None
+        self._thread_handle: Any = None
+
+    def __enter__(self) -> "CurrentThreadPriorityBoost":
+        if not self.enabled:
+            return self
+        if os.name != "nt":
+            self.error = "非 Windows"
+            return self
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetCurrentThread.restype = wintypes.HANDLE
+            kernel32.GetThreadPriority.argtypes = (wintypes.HANDLE,)
+            kernel32.GetThreadPriority.restype = ctypes.c_int
+            kernel32.SetThreadPriority.argtypes = (wintypes.HANDLE, ctypes.c_int)
+            kernel32.SetThreadPriority.restype = wintypes.BOOL
+
+            thread = kernel32.GetCurrentThread()
+            previous = kernel32.GetThreadPriority(thread)
+            if previous == THREAD_PRIORITY_ERROR_RETURN:
+                self.error = "GetThreadPriority 失败"
+                return self
+            self._kernel32 = kernel32
+            self._thread_handle = thread
+            self.previous_priority = previous
+            if kernel32.SetThreadPriority(thread, self.priority):
+                self.applied = True
+            else:
+                self.error = "SetThreadPriority 失败"
+        except Exception as exc:
+            self.error = f"{exc.__class__.__name__}: {exc}"
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        if not self.applied or self.previous_priority is None or self._kernel32 is None or self._thread_handle is None:
+            return
+        try:
+            self._kernel32.SetThreadPriority(self._thread_handle, self.previous_priority)
+        except Exception:
+            pass
+
+    def describe(self) -> str:
+        if not self.enabled:
+            return "关闭"
+        if self.applied:
+            return f"已启用 THREAD_PRIORITY_HIGHEST，原优先级={self.previous_priority}"
+        return f"未启用: {self.error or '未知原因'}"
+
+
 def _initialize_com_for_uia_worker() -> Callable[[], None]:
     try:
         comtypes = require_module("comtypes", "comtypes")
@@ -737,41 +960,43 @@ def execute_comment_send_plan(
         if callable(set_input_timing_context):
             set_input_timing_context(context)
 
-    send_flow_start = time.perf_counter()
-    step_start = time.perf_counter()
-    set_timing_context("点操作")
-    input_backend.click(plan.action_point, interval=0.0)
-    action_click_ms = int((time.perf_counter() - step_start) * 1000)
+    priority_boost = CurrentThreadPriorityBoost(comment_input_priority_boost_enabled())
+    with priority_boost:
+        send_flow_start = time.perf_counter()
+        step_start = time.perf_counter()
+        set_timing_context("点操作")
+        input_backend.click(plan.action_point, interval=0.0)
+        action_click_ms = int((time.perf_counter() - step_start) * 1000)
 
-    step_start = time.perf_counter()
-    set_timing_context("打开评论")
-    input_backend.press_sequence_atomic(plan.open_comment_keys)
-    open_comment_ms = int((time.perf_counter() - step_start) * 1000)
+        step_start = time.perf_counter()
+        set_timing_context("打开评论")
+        input_backend.press_sequence_atomic(plan.open_comment_keys)
+        open_comment_ms = int((time.perf_counter() - step_start) * 1000)
 
-    step_start = time.perf_counter()
-    set_timing_context("输入")
-    if can_direct_type_text:
-        text_input_method = input_backend.type_text_directly(plan.text)
-    else:
-        text_input_method = input_backend.paste_text(
-            plan.text,
-            restore_clipboard=False,
-            before_paste_delay=0.0,
-            after_paste_delay=0.012,
-        )
-    text_input_ms = int((time.perf_counter() - step_start) * 1000)
+        step_start = time.perf_counter()
+        set_timing_context("输入")
+        if can_direct_type_text:
+            text_input_method = input_backend.type_text_directly(plan.text)
+        else:
+            text_input_method = input_backend.paste_text(
+                plan.text,
+                restore_clipboard=False,
+                before_paste_delay=0.0,
+                after_paste_delay=0.012,
+            )
+        text_input_ms = int((time.perf_counter() - step_start) * 1000)
 
-    send_step_label = "发送点击" if plan.submit_mode == "click" else "发送快捷键"
-    step_start = time.perf_counter()
-    if plan.submit_mode == "click":
-        set_timing_context("发送点击")
-        input_backend.click(plan.send_point, interval=0.0)
-        send_submit_ms = int((time.perf_counter() - step_start) * 1000)
-    else:
-        set_timing_context("发送快捷键")
-        input_backend.press_sequence_atomic(plan.submit_comment_keys)
-        send_submit_ms = int((time.perf_counter() - step_start) * 1000)
-    total_send_ms = int((time.perf_counter() - send_flow_start) * 1000)
+        send_step_label = "发送点击" if plan.submit_mode == "click" else "发送快捷键"
+        step_start = time.perf_counter()
+        if plan.submit_mode == "click":
+            set_timing_context("发送点击")
+            input_backend.click(plan.send_point, interval=0.0)
+            send_submit_ms = int((time.perf_counter() - step_start) * 1000)
+        else:
+            set_timing_context("发送快捷键")
+            input_backend.press_sequence_atomic(plan.submit_comment_keys)
+            send_submit_ms = int((time.perf_counter() - step_start) * 1000)
+        total_send_ms = int((time.perf_counter() - send_flow_start) * 1000)
     input_timings_fn = getattr(input_backend, "input_timings", None)
     input_timings = input_timings_fn() if callable(input_timings_fn) else ()
     return CommentSendResult(
@@ -783,6 +1008,7 @@ def execute_comment_send_plan(
         total_send_ms=total_send_ms,
         send_step_label=send_step_label,
         input_timings=input_timings,
+        priority_boost_detail=priority_boost.describe(),
     )
 
 
@@ -796,6 +1022,8 @@ def print_comment_send_result(plan: CommentSendPlan, result: CommentSendResult) 
         f"点操作={result.action_click_ms}ms | 打开评论={result.open_comment_ms}ms | "
         f"输入={result.text_input_ms}ms | {result.send_step_label}={result.send_submit_ms}ms"
     )
+    if plan.timing_detail and result.priority_boost_detail:
+        print(f"输入线程优先级: {result.priority_boost_detail}")
     if result.input_timings:
         print("底层输入耗时:")
         for label, elapsed_ns in result.input_timings:
@@ -886,6 +1114,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "comment-fixed-send-locate": cmd_comment_fixed_send_locate,
         "post-image-locate": lambda a: cmd_post_image_locate(a, x_only=False),
         "post-image-x-locate": lambda a: cmd_post_image_locate(a, x_only=True),
+        "input-bench": cmd_input_bench,
         "comment": cmd_comment,
         "llm": cmd_llm,
         "doubao": cmd_doubao,

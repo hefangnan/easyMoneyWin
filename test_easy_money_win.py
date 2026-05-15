@@ -636,6 +636,85 @@ class EasyMoneyWinTests(unittest.TestCase):
                 with self.assertRaises(em.EasyMoneyError):
                     em.parse_comment_options(args)
 
+    def test_input_bench_options_parse_keys_and_point(self):
+        options = em_commands.parse_input_bench_options([
+            "--kind",
+            "keys",
+            "--keys",
+            "tab,enter",
+            "--count",
+            "1000",
+            "--warmup",
+            "20",
+            "--interval-ms",
+            "1",
+            "--countdown-ms",
+            "0",
+            "--point",
+            "10,20",
+            "--confirm-send",
+            "--priority-boost",
+        ])
+
+        self.assertEqual(options.kind, "keys")
+        self.assertEqual(options.keys, ("tab", "enter"))
+        self.assertEqual(options.count, 1000)
+        self.assertEqual(options.warmup, 20)
+        self.assertEqual(options.interval_ms, 1)
+        self.assertEqual(options.countdown_ms, 0)
+        self.assertEqual(options.point, em.Point(10, 20))
+        self.assertTrue(options.confirm_send)
+        self.assertTrue(options.priority_boost)
+
+    def test_input_bench_nearest_rank_stats(self):
+        values = [index * 1_000_000 for index in range(1, 101)]
+        stats = em_commands.collect_input_bench_stats(values)
+
+        self.assertEqual(stats["min"], 1_000_000)
+        self.assertEqual(stats["p50"], 50_000_000)
+        self.assertEqual(stats["p95"], 95_000_000)
+        self.assertEqual(stats["p99"], 99_000_000)
+        self.assertEqual(stats["max"], 100_000_000)
+
+    def test_current_thread_priority_boost_restores_priority(self):
+        class FakeFunc:
+            def __init__(self, func):
+                self.func = func
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self.func(*args)
+
+        class FakeKernel32:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, object]] = []
+                self.GetCurrentThread = FakeFunc(lambda: 123)
+                self.GetThreadPriority = FakeFunc(lambda handle: 0)
+                self.SetThreadPriority = FakeFunc(self.set_thread_priority)
+
+            def set_thread_priority(self, handle: int, priority: int) -> int:
+                self.calls.append(("SetThreadPriority", priority))
+                return 1
+
+        fake_kernel32 = FakeKernel32()
+        fake_windll = type("FakeWindll", (), {"kernel32": fake_kernel32})()
+        old_windll = em_commands.ctypes.windll
+        old_os_name = em_commands.os.name
+        try:
+            em_commands.ctypes.windll = fake_windll
+            em_commands.os.name = "nt"
+            with em_commands.CurrentThreadPriorityBoost(True) as boost:
+                self.assertTrue(boost.applied)
+                self.assertEqual(boost.previous_priority, 0)
+            self.assertEqual(fake_kernel32.calls, [
+                ("SetThreadPriority", em_core.THREAD_PRIORITY_HIGHEST),
+                ("SetThreadPriority", 0),
+            ])
+        finally:
+            em_commands.ctypes.windll = old_windll
+            em_commands.os.name = old_os_name
+
     def test_comment_prefers_direct_input_when_backend_supports_text(self):
         class FakeInputBackend:
             def can_type_text_directly(self, text: str) -> bool:

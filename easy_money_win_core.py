@@ -28,6 +28,8 @@ DIRECT_TEXT_ENTRY_MAX_UTF16_UNITS = 512
 DIRECT_TEXT_ENTRY_CHUNK_UTF16_UNITS = 64
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+THREAD_PRIORITY_HIGHEST = 2
+THREAD_PRIORITY_ERROR_RETURN = 0x7FFFFFFF
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
@@ -243,6 +245,20 @@ class CommentSendResult:
     total_send_ms: int
     send_step_label: str
     input_timings: tuple[tuple[str, int], ...] = ()
+    priority_boost_detail: str = ""
+
+
+@dataclass(frozen=True)
+class InputBenchOptions:
+    kind: str = "click"
+    count: int = 100
+    warmup: int = 10
+    keys: tuple[str, ...] = ("tab", "enter")
+    interval_ms: int = 0
+    countdown_ms: int = 3000
+    point: Optional[Point] = None
+    confirm_send: bool = False
+    priority_boost: bool = False
 
 
 HOME = Path.home()

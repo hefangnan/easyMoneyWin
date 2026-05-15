@@ -345,6 +345,17 @@ class EasyMoneyWinTests(unittest.TestCase):
         self.assertEqual(rects[2], em.Rect(424, 324, 544, 444))
         self.assertEqual(rects[3], em.Rect(176, 448, 296, 568))
 
+    def test_inline_image_capture_rect_uses_target_union(self):
+        capture_info = em.inline_image_capture_rect(
+            [em.Rect(176, 324, 296, 444), em.Rect(300, 324, 420, 444)],
+            em.Rect(0, 0, 1000, 1000),
+        )
+
+        self.assertIsNotNone(capture_info)
+        capture_rect, clipped_rects = capture_info
+        self.assertEqual(capture_rect, em.Rect(176, 324, 420, 444))
+        self.assertEqual(clipped_rects, [em.Rect(176, 324, 296, 444), em.Rect(300, 324, 420, 444)])
+
     def test_single_uia_inline_image_region_uses_keyboard_focus_and_loaded_check(self):
         old_window_backend = em_llm.WindowBackend
         old_input_backend = em_llm.InputBackend
@@ -398,8 +409,9 @@ class EasyMoneyWinTests(unittest.TestCase):
                 events.append(("press", (tuple(keys), gap)))
 
         class FakeWindowImage:
-            width = 1000
-            height = 1000
+            def __init__(self, rect: em.Rect) -> None:
+                self.width = int(rect.width)
+                self.height = int(rect.height)
 
             def crop(self, box):
                 events.append(("crop", box))
@@ -408,7 +420,7 @@ class EasyMoneyWinTests(unittest.TestCase):
         class FakeCaptureBackend:
             def screenshot_stream(self, rect: em.Rect) -> FakeWindowImage:
                 events.append(("screenshot_stream", rect))
-                return FakeWindowImage()
+                return FakeWindowImage(rect)
 
             def close(self) -> None:
                 events.append(("close", None))
@@ -432,7 +444,8 @@ class EasyMoneyWinTests(unittest.TestCase):
             self.assertIs(image, cropped)
             self.assertIn(("prepare", ("down", "tab", "tab", "tab")), events)
             self.assertIn(("press", (("down", "tab", "tab", "tab"), 0.0)), events)
-            self.assertIn(("crop", (176, 324, 296, 444)), events)
+            self.assertIn(("screenshot_stream", em.Rect(176, 324, 296, 444)), events)
+            self.assertIn(("crop", (0, 0, 120, 120)), events)
         finally:
             em_llm.WindowBackend = old_window_backend
             em_llm.InputBackend = old_input_backend
@@ -498,8 +511,9 @@ class EasyMoneyWinTests(unittest.TestCase):
                 events.append(("press", (tuple(keys), gap)))
 
         class FakeWindowImage:
-            width = 1000
-            height = 1000
+            def __init__(self, rect: em.Rect) -> None:
+                self.width = int(rect.width)
+                self.height = int(rect.height)
 
             def crop(self, box):
                 events.append(("crop", box))
@@ -507,7 +521,8 @@ class EasyMoneyWinTests(unittest.TestCase):
 
         class FakeCaptureBackend:
             def screenshot_stream(self, rect: em.Rect) -> FakeWindowImage:
-                return FakeWindowImage()
+                events.append(("screenshot_stream", rect))
+                return FakeWindowImage(rect)
 
             def close(self) -> None:
                 pass
@@ -531,7 +546,8 @@ class EasyMoneyWinTests(unittest.TestCase):
             self.assertIs(image, cropped)
             self.assertIn(("press", (("down", "tab", "tab", "tab"), 0.0)), events)
             self.assertIn(("press", (("tab",), 0.0)), events)
-            self.assertIn(("crop", (180, 330, 300, 450)), events)
+            self.assertIn(("screenshot_stream", em.Rect(180, 330, 300, 450)), events)
+            self.assertIn(("crop", (0, 0, 120, 120)), events)
         finally:
             em_llm.WindowBackend = old_window_backend
             em_llm.InputBackend = old_input_backend

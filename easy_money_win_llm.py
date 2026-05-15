@@ -470,26 +470,46 @@ def rect_intersects(lhs: Rect, rhs: Rect) -> bool:
     return lhs.left < rhs.right and lhs.right > rhs.left and lhs.top < rhs.bottom and lhs.bottom > rhs.top
 
 
+def inline_image_capture_rect(rects: list[Rect], window_rect: Rect) -> tuple[Rect, list[Rect]] | None:
+    clipped_rects = [rect.clamp_to(window_rect) for rect in rects]
+    clipped_rects = [rect for rect in clipped_rects if rect.width > 1 and rect.height > 1]
+    if not clipped_rects:
+        return None
+    capture_rect = Rect(
+        min(rect.left for rect in clipped_rects),
+        min(rect.top for rect in clipped_rects),
+        max(rect.right for rect in clipped_rects),
+        max(rect.bottom for rect in clipped_rects),
+    ).clamp_to(window_rect)
+    if capture_rect.width <= 1 or capture_rect.height <= 1:
+        return None
+    return capture_rect, clipped_rects
+
+
 def crop_loaded_inline_image_regions(rects: list[Rect], window_rect: Rect, label: str) -> list[Any]:
     if not rects:
         return []
+    capture_info = inline_image_capture_rect(rects, window_rect)
+    if capture_info is None:
+        return []
+    capture_rect, clipped_rects = capture_info
     timeout_ms = inline_image_load_timeout_ms()
     interval_ms = inline_image_load_interval_ms()
     deadline = time.perf_counter() + timeout_ms / 1000.0
-    loaded: list[Any | None] = [None] * len(rects)
+    loaded: list[Any | None] = [None] * len(clipped_rects)
     attempts = 0
     capture = CaptureBackend()
     try:
         while time.perf_counter() < deadline and any(image is None for image in loaded):
-            full_window_image = capture.screenshot_stream(window_rect)
+            capture_image = capture.screenshot_stream(capture_rect)
             attempts += 1
-            for index, screen_rect in enumerate(rects):
+            for index, screen_rect in enumerate(clipped_rects):
                 if loaded[index] is not None:
                     continue
-                left, top, right, bottom = image_crop_box_from_screen_rect(screen_rect, window_rect, full_window_image)
+                left, top, right, bottom = image_crop_box_from_screen_rect(screen_rect, capture_rect, capture_image)
                 if right - left <= 1 or bottom - top <= 1:
                     continue
-                cropped = full_window_image.crop((left, top, right, bottom))
+                cropped = capture_image.crop((left, top, right, bottom))
                 if inline_image_looks_loaded(cropped):
                     loaded[index] = cropped
             if any(image is None for image in loaded) and interval_ms > 0:

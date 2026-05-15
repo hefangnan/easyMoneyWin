@@ -353,8 +353,6 @@ class EasyMoneyWinTests(unittest.TestCase):
         old_env = {
             key: os.environ.get(key)
             for key in (
-                "EASYMONEY_SINGLE_IMAGE_ACTIVATE_WAIT_MS",
-                "EASYMONEY_SINGLE_IMAGE_FOCUS_WAIT_MS",
                 "EASYMONEY_SINGLE_IMAGE_KEY_GAP_MS",
             )
         }
@@ -416,8 +414,6 @@ class EasyMoneyWinTests(unittest.TestCase):
                 events.append(("close", None))
 
         try:
-            os.environ["EASYMONEY_SINGLE_IMAGE_ACTIVATE_WAIT_MS"] = "0"
-            os.environ["EASYMONEY_SINGLE_IMAGE_FOCUS_WAIT_MS"] = "0"
             os.environ["EASYMONEY_SINGLE_IMAGE_KEY_GAP_MS"] = "0"
             em_llm.WindowBackend = FakeWindowBackend
             em_llm.InputBackend = FakeInputBackend
@@ -448,7 +444,7 @@ class EasyMoneyWinTests(unittest.TestCase):
                 else:
                     os.environ[key] = value
 
-    def test_single_uia_inline_image_region_tabs_once_more_when_focus_name_is_not_image(self):
+    def test_single_uia_inline_image_region_tabs_once_more_when_focus_name_is_full_text(self):
         old_window_backend = em_llm.WindowBackend
         old_input_backend = em_llm.InputBackend
         old_capture_backend = em_llm.CaptureBackend
@@ -456,7 +452,6 @@ class EasyMoneyWinTests(unittest.TestCase):
         old_env = {
             key: os.environ.get(key)
             for key in (
-                "EASYMONEY_SINGLE_IMAGE_FOCUS_WAIT_MS",
                 "EASYMONEY_SINGLE_IMAGE_KEY_GAP_MS",
             )
         }
@@ -487,7 +482,7 @@ class EasyMoneyWinTests(unittest.TestCase):
                 return em.Rect(180, 330, 300, 450)
 
             def _safe_text(self, element: object) -> str:
-                return "评论" if element is first_focus else "图片"
+                return "全文" if element is first_focus else "图片"
 
             def _control_type(self, element: object) -> str:
                 return "按钮"
@@ -518,7 +513,6 @@ class EasyMoneyWinTests(unittest.TestCase):
                 pass
 
         try:
-            os.environ["EASYMONEY_SINGLE_IMAGE_FOCUS_WAIT_MS"] = "0"
             os.environ["EASYMONEY_SINGLE_IMAGE_KEY_GAP_MS"] = "0"
             em_llm.WindowBackend = FakeWindowBackend
             em_llm.InputBackend = FakeInputBackend

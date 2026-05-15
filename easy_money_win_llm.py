@@ -533,22 +533,16 @@ def locate_single_uia_inline_image_rect(post: MomentPostResolution, window_rect:
     key_gap_ms = max(0, min(int(first_non_empty_env(["EASYMONEY_SINGLE_IMAGE_KEY_GAP_MS"]) or "30"), 1000))
     input_backend.press_sequence(SINGLE_IMAGE_FOCUS_KEYS, gap=key_gap_ms / 1000.0)
 
-    focus_wait_ms = max(0, min(int(first_non_empty_env(["EASYMONEY_SINGLE_IMAGE_FOCUS_WAIT_MS"]) or "120"), 3000))
-    if focus_wait_ms > 0:
-        time.sleep(focus_wait_ms / 1000.0)
-
     automation, _ = backend._ensure_automation()
     focused = automation.GetFocusedElement()
     if focused is None:
         raise EasyMoneyError("单图键盘定位失败: 未读取到当前焦点元素")
-    if backend._safe_text(focused).strip() != "图片":
+    if backend._safe_text(focused).strip() == "全文":
         input_backend.prepare_key_sequence(("tab",))
         input_backend.press_sequence(("tab",), gap=key_gap_ms / 1000.0)
-        if focus_wait_ms > 0:
-            time.sleep(focus_wait_ms / 1000.0)
         focused = automation.GetFocusedElement()
         if focused is None:
-            raise EasyMoneyError("单图键盘定位失败: 兜底Tab后未读取到当前焦点元素")
+            raise EasyMoneyError("单图键盘定位失败: 全文后Tab未读取到当前焦点元素")
     focus_rect = backend.rect(focused)
     if focus_rect is None:
         raise EasyMoneyError("单图键盘定位失败: 当前焦点元素没有有效矩形")

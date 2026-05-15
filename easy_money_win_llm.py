@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 
 from easy_money_win_core import *
@@ -9,6 +10,7 @@ from easy_money_win_uia import WindowBackend
 
 
 SINGLE_IMAGE_FOCUS_KEYS = ("down", "tab", "tab", "tab")
+SCRIPT_PLAYER_COUNTS_ENV_KEYS = ("EASYMONEY_SCRIPT_COUNTS_PATH", "WECHAT_SCRIPT_COUNTS_PATH")
 
 def load_easy_money_dotenv() -> dict[str, str]:
     values: dict[str, str] = {}
@@ -175,6 +177,112 @@ def _strip_answer_noise(answer: str) -> str:
     return cleaned.strip()
 
 
+def _normalize_script_title(title: str) -> str:
+    return re.sub(r"\s+", "", title).strip("《》【】[]()（）「」『』“”\"'")
+
+
+def _coerce_player_count(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        return int(value) if value.is_integer() and value > 0 else None
+    if isinstance(value, str):
+        gender_counts = [int(item) for item in re.findall(r"(\d+)\s*[男女]", value)]
+        if gender_counts:
+            return sum(gender_counts)
+        match = re.search(r"\d+", value)
+        return int(match.group(0)) if match else None
+    if isinstance(value, dict):
+        for key in ("players", "player_count", "playerCount", "count", "人数"):
+            if key in value:
+                count = _coerce_player_count(value[key])
+                if count is not None:
+                    return count
+        gender_total = 0
+        for key in ("male", "female", "男", "女"):
+            count = _coerce_player_count(value.get(key))
+            if count is not None:
+                gender_total += count
+        return gender_total or None
+    return None
+
+
+def _script_aliases(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    raw_aliases = value.get("aliases") or value.get("alias") or value.get("aka") or value.get("别名")
+    if raw_aliases is None:
+        return []
+    if isinstance(raw_aliases, str):
+        candidates = re.split(r"\s*(?:,|，|、|/|／|\|)\s*", raw_aliases)
+    elif isinstance(raw_aliases, list):
+        candidates = [str(item) for item in raw_aliases]
+    else:
+        candidates = [str(raw_aliases)]
+    aliases = []
+    for candidate in candidates:
+        normalized = _normalize_script_title(candidate)
+        if normalized and normalized not in aliases:
+            aliases.append(normalized)
+    return aliases
+
+
+def _add_script_count_aliases(counts: dict[str, int], title: str, value: Any, count: int) -> None:
+    normalized = _normalize_script_title(title)
+    aliases = _script_aliases(value)
+    for key in [normalized, *aliases]:
+        if key:
+            counts[key] = count
+
+
+def _collect_script_player_counts(root: Any) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if isinstance(root, dict):
+        for key in ("scripts", "script_player_counts", "player_counts", "剧本"):
+            nested = root.get(key)
+            if isinstance(nested, (dict, list)):
+                counts.update(_collect_script_player_counts(nested))
+        for title, value in root.items():
+            if title in {"scripts", "script_player_counts", "player_counts", "剧本"}:
+                continue
+            count = _coerce_player_count(value)
+            if count is not None:
+                _add_script_count_aliases(counts, str(title), value, count)
+    elif isinstance(root, list):
+        for item in root:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("name") or item.get("title") or item.get("script") or item.get("剧本")
+            count = _coerce_player_count(item)
+            if title and count is not None:
+                _add_script_count_aliases(counts, str(title), item, count)
+    return counts
+
+
+def script_player_count_paths() -> list[Path]:
+    configured = first_non_empty_env(SCRIPT_PLAYER_COUNTS_ENV_KEYS)
+    if configured:
+        return [path for path in [expand_path(configured)] if path is not None]
+    return [Path.cwd() / "script_player_counts.json", HOME / ".easyMoney_script_counts.json"]
+
+
+def load_script_player_counts() -> dict[str, int]:
+    for path in script_player_count_paths():
+        if not path.exists():
+            continue
+        try:
+            root = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print_ts(f"剧本人数表读取失败: {path} ({exc})")
+            return {}
+        counts = _collect_script_player_counts(root)
+        if counts:
+            return counts
+    return {}
+
+
 def _first_rule_answer(patterns: Iterable[str], text: str) -> tuple[Optional[str], str]:
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -184,6 +292,93 @@ def _first_rule_answer(patterns: Iterable[str], text: str) -> tuple[Optional[str
         if answer:
             return answer, pattern
     return None, ""
+
+
+def _format_rule_number(value: float | int) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, int):
+        return str(value)
+    return f"{value:.6g}"
+
+
+def _extract_question_fragment(text: str) -> str:
+    match = re.search(r"问题\s*[:：]\s*(.+?[？?])", text)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"问题\s*[:：]\s*(.+?)(?:正确答案|答案打在|本次|评论后|$)", text)
+    if match:
+        return match.group(1).strip()
+    return text
+
+
+def _extract_bracketed_script_titles(text: str) -> list[str]:
+    titles = []
+    for bracketed_text in re.findall(r"[【《]([^】》]{1,120})[】》]", text):
+        for title in re.split(r"\s*(?:\+|＋|➕|、|，|,|/|／)\s*", bracketed_text):
+            normalized = _normalize_script_title(title)
+            if normalized and normalized not in titles:
+                titles.append(normalized)
+    return titles
+
+
+def _script_count_adjustments(question: str) -> list[tuple[str, float]]:
+    pattern = re.compile(r"(加上?|减去?|乘以?|除以?|\+|＋|➕|-|－|➖|×|x|X|\*|✕|✖\ufe0f?|÷|/|／|➗)\s*(\d+(?:\.\d+)?)")
+    adjustments: list[tuple[str, float]] = []
+    for match in pattern.finditer(question):
+        raw_operator = match.group(1)
+        raw_value = match.group(2)
+        if raw_operator in {"+", "＋", "➕"} or raw_operator.startswith("加"):
+            operator = "+"
+        elif raw_operator in {"-", "－", "➖"} or raw_operator.startswith("减"):
+            operator = "-"
+        elif raw_operator in {"×", "x", "X", "*", "✕"} or raw_operator.startswith("✖") or raw_operator.startswith("乘"):
+            operator = "*"
+        elif raw_operator in {"÷", "/", "／", "➗"} or raw_operator.startswith("除"):
+            operator = "/"
+        else:
+            continue
+        adjustments.append((operator, float(raw_value)))
+    return adjustments
+
+
+def _solve_script_player_count_question(text: str) -> Optional[SolvedQuestion]:
+    question = _extract_question_fragment(text)
+    if not re.search(r"(?:玩家)?人数|几人|人數", question):
+        return None
+    titles = _extract_bracketed_script_titles(question)
+    if not titles:
+        return None
+    counts = load_script_player_counts()
+    if not counts:
+        return None
+    missing = [title for title in titles if title not in counts]
+    if missing:
+        return SolvedQuestion(
+            answer="不知道",
+            evidence=f"本地规则: 剧本人数表缺少 {', '.join(missing)}",
+            confidence=0.0,
+            source="local-rules",
+        )
+
+    total: float = float(sum(counts[title] for title in titles))
+    adjustments = _script_count_adjustments(question)
+    for operator, value in adjustments:
+        if operator == "+":
+            total += value
+        elif operator == "-":
+            total -= value
+        elif operator == "*":
+            total *= value
+        elif operator == "/":
+            if value == 0:
+                return SolvedQuestion(answer="不知道", evidence="本地规则: 剧本人数计算除数为0", confidence=0.0, source="local-rules")
+            total /= value
+
+    details = " + ".join(f"{title}={counts[title]}" for title in titles)
+    for operator, value in adjustments:
+        details += f" {operator} {_format_rule_number(value)}"
+    return SolvedQuestion(answer=_format_rule_number(total), evidence=f"本地规则: 剧本人数计算({details})", confidence=0.9, source="local-rules")
 
 
 def _solve_simple_arithmetic(text: str) -> Optional[str]:
@@ -199,9 +394,9 @@ def _solve_simple_arithmetic(text: str) -> Optional[str]:
     except Exception:
         return None
     if isinstance(value, float) and value.is_integer():
-        return str(int(value))
+        return _format_rule_number(value)
     if isinstance(value, (int, float)):
-        return f"{value:.6g}"
+        return _format_rule_number(value)
     return None
 
 
@@ -210,11 +405,17 @@ def solve_post_question_by_rules(post_text: str) -> SolvedQuestion:
     if not text:
         return SolvedQuestion(answer="不知道", evidence="本地规则: 空正文", confidence=0.0, source="local-rules")
 
+    solved_script_count = _solve_script_player_count_question(text)
+    if solved_script_count is not None:
+        return solved_script_count
+
     answer, pattern = _first_rule_answer(
         [
             r"(?:正确答案|标准答案|参考答案|答案)\s*(?:是|为|:|：)\s*([^。！？!?\n\r；;，,]{1,64})",
             r"(?:谜底|口令|暗号|密码)\s*(?:为|:|：)\s*([^。！？!?\n\r；;，,]{1,64})",
-            r"(?:请|可)?(?:评论|回复|留言|输入|发送)\s*[\"'“”‘’「」『』【】\[\]]?\s*([^\"'“”‘’「」『』【】\[\]。！？!?\n\r；;，,]{1,64})",
+            r"(?:请|可)?(?:评论|回复|留言|输入|发送)\s*[\"'“”‘’「」『』【\[]\s*([^\"'“”‘’「」『』】\]。！？!?\n\r；;，,]{1,64})",
+            r"(?:请|可)?(?:评论|回复|留言|输入|发送)(?:内容|答案|口令|暗号)?\s*[:：]\s*([^。！？!?\n\r；;，,]{1,64})",
+            r"(?:请|可)?(?:评论|回复|留言|输入|发送)\s+([^。！？!?\n\r；;，,]{1,64})",
             r"(?:把|将)\s*[\"'“”‘’「」『』【】\[\]]?\s*([^\"'“”‘’「」『』【】\[\]。！？!?\n\r；;，,]{1,64})\s*(?:发|打|写|填|评论|回复|留言|输入|发送)",
         ],
         text,

@@ -88,6 +88,118 @@ class EasyMoneyWinTests(unittest.TestCase):
 
         self.assertEqual(solved.answer, "B")
 
+    def test_local_question_rules_uses_script_player_counts_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "script_player_counts.json"
+            path.write_text(
+                '{"金粉": 6, "青白": {"players": 6}}',
+                encoding="utf-8",
+            )
+            old_path = os.environ.get("EASYMONEY_SCRIPT_COUNTS_PATH")
+            try:
+                os.environ["EASYMONEY_SCRIPT_COUNTS_PATH"] = str(path)
+                solved = em.solve_post_question_by_rules(
+                    "请在此条朋友圈下算出 问题：剧本【金粉】+【青白】玩家人数总和➕2🟰？ "
+                    "正确答案打在评论区！ 评论后请耐心等待"
+                )
+
+                self.assertEqual(solved.answer, "14")
+                self.assertIn("剧本人数计算", solved.evidence)
+            finally:
+                if old_path is None:
+                    os.environ.pop("EASYMONEY_SCRIPT_COUNTS_PATH", None)
+                else:
+                    os.environ["EASYMONEY_SCRIPT_COUNTS_PATH"] = old_path
+
+    def test_local_question_rules_splits_script_titles_inside_one_bracket(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "script_player_counts.json"
+            path.write_text(
+                '{"青白": 6, "草芥": 6, "吹梦到西州": 6, "玫瑰锈病": 6}',
+                encoding="utf-8",
+            )
+            old_path = os.environ.get("EASYMONEY_SCRIPT_COUNTS_PATH")
+            try:
+                os.environ["EASYMONEY_SCRIPT_COUNTS_PATH"] = str(path)
+                solved = em.solve_post_question_by_rules(
+                    "问题：剧本【青白+草芥+吹梦到西州+玫瑰锈病】玩家人数总和➕5🟰？"
+                    "正确答案打在评论区！"
+                )
+
+                self.assertEqual(solved.answer, "29")
+            finally:
+                if old_path is None:
+                    os.environ.pop("EASYMONEY_SCRIPT_COUNTS_PATH", None)
+                else:
+                    os.environ["EASYMONEY_SCRIPT_COUNTS_PATH"] = old_path
+
+    def test_local_question_rules_supports_script_count_multiply_and_divide(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "script_player_counts.json"
+            path.write_text(
+                '{"青白": 6, "草芥": 6}',
+                encoding="utf-8",
+            )
+            old_path = os.environ.get("EASYMONEY_SCRIPT_COUNTS_PATH")
+            try:
+                os.environ["EASYMONEY_SCRIPT_COUNTS_PATH"] = str(path)
+
+                multiplied = em.solve_post_question_by_rules("问题：剧本【青白+草芥】玩家人数总和✖️2➕5🟰？")
+                divided = em.solve_post_question_by_rules("问题：剧本【青白+草芥】玩家人数总和÷3🟰？")
+
+                self.assertEqual(multiplied.answer, "29")
+                self.assertEqual(divided.answer, "4")
+            finally:
+                if old_path is None:
+                    os.environ.pop("EASYMONEY_SCRIPT_COUNTS_PATH", None)
+                else:
+                    os.environ["EASYMONEY_SCRIPT_COUNTS_PATH"] = old_path
+
+    def test_local_question_rules_ignores_script_list_after_question_mark(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "script_player_counts.json"
+            path.write_text(
+                '{"青白": 6, "草芥": 6, "吹梦到西州": 6, "玫瑰锈病": 6}',
+                encoding="utf-8",
+            )
+            old_path = os.environ.get("EASYMONEY_SCRIPT_COUNTS_PATH")
+            try:
+                os.environ["EASYMONEY_SCRIPT_COUNTS_PATH"] = str(path)
+                solved = em.solve_post_question_by_rules(
+                    "Doudo 请在此条朋友圈下算出！！！ "
+                    "问题：剧本【青白+草芥+吹梦到西州+玫瑰锈病】玩家人数总和➕5🟰？ "
+                    "本次只开4月周末场情感本车次 本次🉑️约剧本单如下： "
+                    "《青白》 《草芥》 《吹梦到西州》 《窃云台》 《如故》 《流氓叙事》 "
+                    "评论后请耐心等待"
+                )
+
+                self.assertEqual(solved.answer, "29")
+                self.assertNotIn("窃云台", solved.evidence)
+            finally:
+                if old_path is None:
+                    os.environ.pop("EASYMONEY_SCRIPT_COUNTS_PATH", None)
+                else:
+                    os.environ["EASYMONEY_SCRIPT_COUNTS_PATH"] = old_path
+
+    def test_local_question_rules_supports_script_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "script_player_counts.json"
+            path.write_text(
+                '{"黎明系列：暗夜将至": {"players": 6, "aliases": ["暗夜", "暗夜将至"]}, "青白": 6}',
+                encoding="utf-8",
+            )
+            old_path = os.environ.get("EASYMONEY_SCRIPT_COUNTS_PATH")
+            try:
+                os.environ["EASYMONEY_SCRIPT_COUNTS_PATH"] = str(path)
+                solved = em.solve_post_question_by_rules("问题：剧本【暗夜+青白】玩家人数总和➕2🟰？")
+
+                self.assertEqual(solved.answer, "14")
+            finally:
+                if old_path is None:
+                    os.environ.pop("EASYMONEY_SCRIPT_COUNTS_PATH", None)
+                else:
+                    os.environ["EASYMONEY_SCRIPT_COUNTS_PATH"] = old_path
+
     def test_resolve_comment_text_uses_local_rules_without_llm(self):
         post = em.MomentPostResolution(
             body_frame=em.Rect(0, 0, 100, 100),
